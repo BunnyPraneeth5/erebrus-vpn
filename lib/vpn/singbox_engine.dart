@@ -1,11 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import '../platform/desktop_system_proxy.dart';
 import '../platform/platform_capabilities.dart';
 import '../settings/split_tunnel_config.dart';
 import 'singbox_desktop_runner.dart';
+import 'vpn_models.dart';
 import 'wg_keygen.dart';
 
 /// Lifecycle stages reported by the native tunnel.
@@ -60,15 +63,65 @@ class SingboxEngine {
 
   Stream<VpnStage>? _stage;
   Stream<VpnStats>? _stats;
+  int _generation = 0;
+  bool? _requestedBlock;
+  bool _requestAccepted = false;
+  VpnStage _nativeStage = VpnStage.disconnected;
+
+  bool get isBlocking => _useDesktopRunner
+      ? _desktop.isBlocking
+      : _requestedBlock == true &&
+            _requestAccepted &&
+            _nativeStage == VpnStage.connected;
+
+  Future<bool> verifyBlocking() async {
+    final generation = _generation;
+    if (_useDesktopRunner) {
+      final verified = await _desktop.verifyBlocking();
+      return generation == _generation && verified && _desktop.isBlocking;
+    }
+    if (_requestedBlock != true || !_requestAccepted) return false;
+    final current = await stage();
+    return generation == _generation &&
+        isBlocking &&
+        current == VpnStage.connected;
+  }
+
+  Future<bool> verifyConnection() async {
+    final generation = _generation;
+    if (_useDesktopRunner) {
+      if (!_desktop.hasRunningProcess ||
+          _desktop.isBlocking ||
+          _stageFrom(_desktop.stage) != VpnStage.connected) {
+        return false;
+      }
+      final enabled = await DesktopSystemProxy.isEnabled(
+        host: SingboxConfigBuilder.localProxyHost,
+        port: SingboxConfigBuilder.localProxyPort,
+      );
+      return generation == _generation &&
+          enabled &&
+          _desktop.hasRunningProcess &&
+          !_desktop.isBlocking &&
+          _stageFrom(_desktop.stage) == VpnStage.connected;
+    }
+    if (_requestedBlock != false || !_requestAccepted) return false;
+    final current = await stage();
+    return generation == _generation &&
+        _requestedBlock == false &&
+        _requestAccepted &&
+        current == VpnStage.connected;
+  }
 
   bool get _useDesktopRunner => PlatformCapabilities.usesDesktopVpnRunner;
 
   /// Stream of lifecycle stages.
   Stream<VpnStage> get onStage => _stage ??= _useDesktopRunner
       ? _desktop.onStage
-      : _statusChannel.receiveBroadcastStream().map(
-          (e) => _stageFrom(e as String?),
-        );
+      : _statusChannel.receiveBroadcastStream().map((e) {
+          _nativeStage = _stageFrom(e as String?);
+          return _nativeStage;
+        });
 
   /// Stream of byte counters (~1s cadence while connected).
   Stream<VpnStats> get onStats => _stats ??= _useDesktopRunner
@@ -104,11 +157,22 @@ class SingboxEngine {
     String configJson, {
     String profileName = 'Erebrus',
     SplitTunnelConfig splitTunnel = const SplitTunnelConfig(),
+    bool preserveProxy = false,
   }) async {
+    final generation = ++_generation;
     if (_useDesktopRunner) {
-      await _desktop.start(configJson, profileName: profileName);
+      await _desktop.start(
+        configJson,
+        profileName: profileName,
+        preserveProxy: preserveProxy,
+      );
       return;
     }
+    _requestedBlock = null;
+    _requestAccepted = false;
+    _nativeStage = VpnStage.connecting;
+    final config = jsonDecode(configJson) as Map<String, dynamic>;
+    _requestedBlock = (config['route'] as Map?)?['final'] == 'block';
     await _method.invokeMethod('start', {
       'config': configJson,
       'name': profileName,
@@ -116,11 +180,16 @@ class SingboxEngine {
       'splitTunnelMode': splitTunnel.mode.name,
       'splitTunnelPackages': splitTunnel.packages,
     });
+    if (generation == _generation) _requestAccepted = true;
   }
 
-  Future<void> stop() async {
+  Future<void> stop({bool preserveProxy = false}) async {
+    ++_generation;
+    _requestedBlock = null;
+    _requestAccepted = false;
+    _nativeStage = VpnStage.disconnecting;
     if (_useDesktopRunner) {
-      await _desktop.stop();
+      await _desktop.stop(preserveProxy: preserveProxy);
       return;
     }
     await _method.invokeMethod('stop');
@@ -131,12 +200,15 @@ class SingboxEngine {
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
     debugPrint('[SingboxEngine] stop: timed out waiting for disconnected');
+    throw StateError('Tunnel stop could not be verified');
   }
 
   Future<VpnStage> stage() async {
     if (_useDesktopRunner) return _stageFrom(_desktop.stage);
+    final generation = _generation;
     final s = await _method.invokeMethod<String>('stage');
-    return _stageFrom(s);
+    if (generation == _generation) _nativeStage = _stageFrom(s);
+    return generation == _generation ? _nativeStage : VpnStage.disconnected;
   }
 
   /// Legacy optional WebView proxy override. Current mobile builds include the
@@ -175,7 +247,9 @@ class SingboxEngine {
   /// Configures Apple VPN On Demand. Other platforms retain their existing
   /// app-launch auto-connect behavior and report this capability as absent.
   Future<bool> setOnDemandEnabled(bool enabled) async {
-    if (_useDesktopRunner) return false;
+    if (!PlatformCapabilities.isIOS && !PlatformCapabilities.isMacOS) {
+      return false;
+    }
     try {
       return await _method.invokeMethod<bool>('setOnDemandEnabled', {
             'enabled': enabled,

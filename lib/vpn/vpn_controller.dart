@@ -13,7 +13,6 @@ import 'gateway_client.dart';
 import 'gateway_controller.dart';
 import 'gateway_errors.dart';
 import 'egress_ip_probe.dart';
-import 'singbox_desktop_runner.dart';
 import 'singbox_engine.dart';
 import 'vpn_models.dart';
 import 'vpn_session_store.dart';
@@ -34,10 +33,64 @@ typedef Provisioner =
 /// sing-box config (WireGuard as the endpoint), and — for Auto/Stealth — falls
 /// back across transports until one establishes.
 class VpnController extends GetxController {
-  VpnController({Provisioner? provisioner}) : _provision = provisioner;
+  VpnController({
+    Provisioner? provisioner,
+    SingboxEngine? engine,
+    this.egressProbe,
+    this.beforeSessionSave,
+  }) : _provision = provisioner,
+       _engine = engine ?? SingboxEngine.instance;
 
-  final _engine = SingboxEngine.instance;
+  final SingboxEngine _engine;
+  final Future<String?> Function()? egressProbe;
   Provisioner? _provision;
+  int _generation = 0;
+  Future<void> _engineQueue = Future<void>.value();
+  bool _blockRecoveryUsed = false;
+  bool _preserveProxy = false;
+  final Future<void> Function()? beforeSessionSave;
+  int _terminalRevision = 0;
+  int? _pendingDropGeneration;
+
+  Future<void> _drainUnexpectedDrop() async {
+    if (_pendingDropGeneration != _generation ||
+        _connectInProgress ||
+        _syncingNative ||
+        killSwitchEngaging.value ||
+        _userDisconnecting ||
+        _cancelRequested) {
+      return;
+    }
+    _pendingDropGeneration = null;
+    await _engageKillSwitch();
+  }
+
+  Future<T?> _engineOperation<T>(int generation, Future<T> Function() action) {
+    final result = _engineQueue.then<T?>((_) async {
+      if (generation != _generation) return null;
+      return await action();
+    });
+    _engineQueue = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
+  Future<String?> _fetchEgress() async {
+    try {
+      if (!await _engine.verifyConnection()) return null;
+      final ip =
+          await (egressProbe?.call() ??
+              EgressIpProbe.fetch(
+                timeout: const Duration(seconds: 6),
+                useTunnelProxy: PlatformCapabilities.usesDesktopVpnRunner,
+              ));
+      return await _engine.verifyConnection() ? ip : null;
+    } catch (_) {
+      return null;
+    }
+  }
 
   // observables
   final stage = VpnStage.disconnected.obs;
@@ -47,6 +100,7 @@ class VpnController extends GetxController {
   final stats = const VpnStats().obs;
   final error = RxnString();
   final killSwitchBlocking = false.obs;
+  final killSwitchEngaging = false.obs;
   final egressIp = RxnString();
   final egressIpLoading = false.obs;
 
@@ -63,6 +117,10 @@ class VpnController extends GetxController {
   StreamSubscription<VpnStats>? _statsSub;
   Worker? _healthWorker;
   Timer? _healthTimer;
+  Worker? _blockingWorker;
+  Timer? _blockingTimer;
+  int _blockingCheckRevision = 0;
+  bool _blockingCheckInProgress = false;
   int _egressFailures = 0;
   bool _wasConnected = false;
   bool _userDisconnecting = false;
@@ -75,7 +133,40 @@ class VpnController extends GetxController {
   static const _kWgPublic = 'erebrus_wg_public';
 
   bool get isConnected => stage.value == VpnStage.connected;
+  bool get isProtected =>
+      isConnected &&
+      tunnelHealthy.value &&
+      !killSwitchEngaging.value &&
+      !killSwitchBlocking.value;
+  String get protectionLabel {
+    if (killSwitchEngaging.value) return 'Securing connection';
+    if (killSwitchBlocking.value) {
+      return PlatformCapabilities.usesDesktopVpnRunner
+          ? 'Proxy traffic blocked'
+          : 'Kill switch active';
+    }
+    if (isProtected) {
+      return PlatformCapabilities.usesDesktopVpnRunner
+          ? 'Proxy protected'
+          : 'Protected';
+    }
+    if (isConnected) return 'Connection unhealthy';
+    if (stage.value == VpnStage.error) return 'Connection failed';
+    return isBusy ? 'Connecting' : 'Disconnected';
+  }
+
+  String get blockingMessage {
+    if (killSwitchEngaging.value) return 'Verifying kill switch enforcement…';
+    if (!killSwitchBlocking.value) {
+      return 'Kill switch protection is not verified';
+    }
+    return PlatformCapabilities.usesDesktopVpnRunner
+        ? 'System-proxy traffic is blocked until you reconnect. Apps that bypass the proxy are not blocked.'
+        : 'Kill switch active — tunnel traffic blocked until you reconnect';
+  }
+
   bool get isBusy =>
+      killSwitchEngaging.value ||
       stage.value == VpnStage.connecting ||
       stage.value == VpnStage.disconnecting;
 
@@ -98,9 +189,59 @@ class VpnController extends GetxController {
         _stopHealthMonitor();
       }
     });
+    _blockingWorker = ever<bool>(killSwitchBlocking, (blocking) {
+      _stopBlockingMonitor();
+      if (blocking) _scheduleBlockingCheck();
+    });
+    if (killSwitchBlocking.value) _scheduleBlockingCheck();
     _stageSub = _engine.onStage.listen((s) {
-      if (killSwitchBlocking.value && s == VpnStage.connected) {
+      if (s == VpnStage.error || s == VpnStage.disconnected) {
+        ++_terminalRevision;
+        if (isConnected || killSwitchBlocking.value) {
+          final wasBlocking = killSwitchBlocking.value;
+          killSwitchBlocking.value = false;
+          tunnelHealthy.value = false;
+          stage.value = VpnStage.error;
+          activeTransport.value = null;
+          egressIp.value = null;
+          egressIpLoading.value = false;
+          _wasConnected = false;
+          _preserveProxy = true;
+          error.value = wasBlocking
+              ? 'Kill switch stopped — protection could not be verified'
+              : 'Connection lost — protection could not be verified';
+          if (!_userDisconnecting &&
+              !_cancelRequested &&
+              _killSwitchEnabled &&
+              (!wasBlocking || !_blockRecoveryUsed)) {
+            if (wasBlocking) _blockRecoveryUsed = true;
+            _pendingDropGeneration = _generation;
+            unawaited(_drainUnexpectedDrop());
+          }
+          return;
+        }
+      }
+      if (_userDisconnecting ||
+          _cancelRequested ||
+          _syncingNative ||
+          _connectInProgress ||
+          killSwitchEngaging.value) {
+        return;
+      }
+      if (killSwitchBlocking.value || _engine.isBlocking) {
+        if (s == VpnStage.connected) {
+          stage.value = VpnStage.error;
+          return;
+        }
+        killSwitchBlocking.value = false;
+        tunnelHealthy.value = false;
         stage.value = VpnStage.error;
+        error.value = 'Kill switch stopped — protection could not be verified';
+        activeTransport.value = null;
+        if (!_blockRecoveryUsed && _killSwitchEnabled) {
+          _blockRecoveryUsed = true;
+          unawaited(_engageKillSwitch());
+        }
         return;
       }
       // During connect(), hold the UI on "connecting" until egress is verified.
@@ -115,7 +256,16 @@ class VpnController extends GetxController {
         debugPrint(
           '[VPN] late connected event after failed connect — stopping zombie tunnel',
         );
-        unawaited(_engine.stop().catchError((_) {}));
+        unawaited(
+          _engineOperation<void>(
+            _generation,
+            () => _engine.stop(preserveProxy: true),
+          ).catchError((_) {}),
+        );
+        return;
+      }
+      if (s == VpnStage.connected && !isProtected) {
+        unawaited(syncWithNative());
         return;
       }
       stage.value = s;
@@ -161,14 +311,60 @@ class VpnController extends GetxController {
   /// Reconciles Flutter observables with the native tunnel and persisted session.
   /// Call on cold start and whenever the app returns to the foreground.
   Future<void> syncWithNative() async {
+    if (_connectInProgress ||
+        killSwitchEngaging.value ||
+        _userDisconnecting ||
+        _cancelRequested ||
+        _syncingNative) {
+      return;
+    }
+    final generation = _generation;
+    final terminalRevision = _terminalRevision;
     _syncingNative = true;
     try {
       final native = await _engine.stage().catchError(
         (_) => VpnStage.disconnected,
       );
       final session = await VpnSessionStore.load();
-
-      if (native == VpnStage.connected) {
+      if (generation != _generation) return;
+      if (killSwitchBlocking.value ||
+          session?.killSwitchActive == true ||
+          _engine.isBlocking) {
+        killSwitchBlocking.value = false;
+        tunnelHealthy.value = false;
+        stage.value = VpnStage.error;
+        _preserveProxy = true;
+        final verified = await _engine.verifyBlocking().catchError(
+          (_) => false,
+        );
+        if (generation != _generation) return;
+        if (verified &&
+            terminalRevision == _terminalRevision &&
+            _engine.isBlocking) {
+          killSwitchBlocking.value = true;
+          error.value = blockingMessage;
+          _applySession(session);
+        } else {
+          await _engageKillSwitch(force: true);
+        }
+        return;
+      }
+      final verifiedConnection =
+          native == VpnStage.connected &&
+          await _engine.verifyConnection().catchError((_) => false);
+      if (generation != _generation) return;
+      if (terminalRevision != _terminalRevision) {
+        stage.value = VpnStage.error;
+        tunnelHealthy.value = false;
+        activeTransport.value = null;
+        error.value = 'Connection lost — protection could not be verified';
+        if (native == VpnStage.connected && _killSwitchEnabled) {
+          _preserveProxy = true;
+          _pendingDropGeneration = generation;
+        }
+        return;
+      }
+      if (verifiedConnection) {
         _wasConnected = true;
         _userDisconnecting = false;
         killSwitchBlocking.value = false;
@@ -178,6 +374,7 @@ class VpnController extends GetxController {
         // so the stage worker's `??=` keeps this value; falls back to now when
         // the snapshot predates this field.
         connectedSince.value = session?.savedAt;
+        tunnelHealthy.value = false;
         stage.value = VpnStage.connected;
         error.value = null;
         if (session?.killSwitchActive == true) {
@@ -195,14 +392,11 @@ class VpnController extends GetxController {
         return;
       }
 
-      if (killSwitchBlocking.value || session?.killSwitchActive == true) {
-        _wasConnected = true;
+      if (native == VpnStage.connected) {
         stage.value = VpnStage.error;
-        error.value =
-            'Kill switch active — traffic blocked until you reconnect';
-        killSwitchBlocking.value = true;
-        _applySession(session);
-        debugPrint('[VPN] sync: kill switch session restored');
+        tunnelHealthy.value = false;
+        activeTransport.value = null;
+        error.value = 'Connection protection could not be verified — reconnect';
         return;
       }
 
@@ -215,6 +409,7 @@ class VpnController extends GetxController {
       debugPrint('[VPN] sync: native ${native.name}');
     } finally {
       _syncingNative = false;
+      await _drainUnexpectedDrop();
     }
   }
 
@@ -254,10 +449,13 @@ class VpnController extends GetxController {
 
   @override
   void onClose() {
+    ++_generation;
     _stageSub?.cancel();
     _statsSub?.cancel();
     _healthWorker?.dispose();
     _healthTimer?.cancel();
+    _blockingWorker?.dispose();
+    _stopBlockingMonitor();
     super.onClose();
   }
 
@@ -283,7 +481,7 @@ class VpnController extends GetxController {
     CredentialBundle? providedBundle,
     String? clientPrivateKey,
   }) async {
-    if (_connectInProgress) {
+    if (_connectInProgress && !_cancelRequested) {
       debugPrint(
         '[VPN] connect already in progress — ignoring duplicate request',
       );
@@ -303,23 +501,32 @@ class VpnController extends GetxController {
       error.value = 'VPN provisioning is not configured';
       return;
     }
+    final generation = ++_generation;
+    _preserveProxy = true;
     _userDisconnecting = false;
     _connectInProgress = true;
     _cancelRequested = false;
     _wasConnected = false;
-    if (killSwitchBlocking.value) {
-      await _engine.stop().catchError((_) {});
-      killSwitchBlocking.value = false;
-      await VpnSessionStore.clear();
-    }
+    _blockRecoveryUsed = false;
+    killSwitchBlocking.value = false;
+    killSwitchEngaging.value = false;
     selectedNode.value = target;
     error.value = null;
+    stage.value = VpnStage.connecting;
 
     try {
+      await _engineOperation<void>(
+        generation,
+        () => _engine.stop(preserveProxy: _preserveProxy),
+      );
+      if (generation != _generation) return;
       for (var attempt = 0; attempt <= 1; attempt++) {
         try {
+          if (generation != _generation) return;
           stage.value = VpnStage.connecting;
-          if (!await _engine.prepare()) {
+          final prepared = await _engine.prepare();
+          if (generation != _generation) return;
+          if (!prepared) {
             error.value =
                 _engine.desktopPrepareError ??
                 (PlatformCapabilities.usesDesktopVpnRunner
@@ -341,6 +548,7 @@ class VpnController extends GetxController {
             }
           } else {
             wgKeys = await _ensureWgKeys();
+            if (generation != _generation) return;
             privateToUse = wgKeys.private;
             bundle = await _provision!(
               node: target,
@@ -348,6 +556,7 @@ class VpnController extends GetxController {
               name: _clientName(),
             );
           }
+          if (generation != _generation) return;
           if (_cancelRequested) {
             await _finishCancelled();
             return;
@@ -373,6 +582,7 @@ class VpnController extends GetxController {
             }
           }
 
+          if (generation != _generation) return;
           // Filter candidate transports to what this node/bundle actually supports.
           final candidates = mode.value.transports.where((t) {
             if (t == Transport.wireguard) return true;
@@ -394,10 +604,12 @@ class VpnController extends GetxController {
               : await SingboxConfigBuilder.resolveDialHosts(bundle);
 
           for (var i = 0; i < candidates.length; i++) {
+            if (generation != _generation) return;
             if (_cancelRequested) break;
             final t = candidates[i];
             try {
               if (i > 0) await _ensureTunnelStopped();
+              if (generation != _generation) return;
               if (_cancelRequested) break;
               stage.value = VpnStage.connecting;
               final config = SingboxConfigBuilder.build(
@@ -417,12 +629,17 @@ class VpnController extends GetxController {
                 '(wg ${bundle.address}, srv $srvShort)',
               );
               var ok = await _armAndStart(
-                _engine.start(
-                  jsonEncode(config),
-                  profileName: 'Erebrus · ${target.name}',
-                  splitTunnel: _splitTunnelConfig(),
+                _engineOperation<void>(
+                  generation,
+                  () => _engine.start(
+                    jsonEncode(config),
+                    profileName: 'Erebrus · ${target.name}',
+                    splitTunnel: _splitTunnelConfig(),
+                    preserveProxy: _preserveProxy,
+                  ),
                 ),
               );
+              if (generation != _generation) return;
               if (!ok) {
                 // Native tunnel may be up while EventChannel/method-channel was blocked (e.g. main-thread ANR).
                 final native = await _engine.stage().catchError(
@@ -442,6 +659,7 @@ class VpnController extends GetxController {
                 final ready = t == Transport.wireguard
                     ? await _waitWireGuardReady()
                     : await _waitStealthReady();
+                if (generation != _generation) return;
                 if (_cancelRequested) break;
                 if (!ready) {
                   debugPrint(
@@ -451,24 +669,23 @@ class VpnController extends GetxController {
                   continue;
                 }
               }
+              if (generation != _generation) return;
               if (ok) {
-                _wasConnected = true;
-                _confirmedTransport = t;
-                activeTransport.value = t;
-                stage.value = VpnStage.connected;
-                error.value = null;
-                unawaited(_probeEgressIp());
-                debugPrint(
-                  '[VPN] connected · mode=${mode.value.label} · transport=${t.label} · '
-                  'config=${t == Transport.wireguard ? "direct-wg" : "stealth-singbox"}',
-                );
-                await VpnSessionStore.save(
-                  node: target,
-                  transport: t,
-                  mode: mode.value,
-                  profileName: 'Erebrus · ${target.name}',
-                );
-                if ((PlatformCapabilities.isIOS ||
+                final terminalRevision = _terminalRevision;
+                tunnelHealthy.value = false;
+                await _engineOperation<void>(generation, () async {
+                  await beforeSessionSave?.call();
+                  if (generation != _generation) return;
+                  await VpnSessionStore.save(
+                    node: target,
+                    transport: t,
+                    mode: mode.value,
+                    profileName: 'Erebrus · ${target.name}',
+                  );
+                });
+                if (generation != _generation) return;
+                if (terminalRevision == _terminalRevision &&
+                    (PlatformCapabilities.isIOS ||
                         PlatformCapabilities.isMacOS) &&
                     Get.isRegistered<AppSettingsController>() &&
                     Get.find<AppSettingsController>()
@@ -476,26 +693,61 @@ class VpnController extends GetxController {
                         .value) {
                   await _engine.setOnDemandEnabled(true);
                 }
+                if (generation != _generation) return;
+                final verified = await _engine.verifyConnection().catchError(
+                  (_) => false,
+                );
+                if (generation != _generation) return;
+                if (!verified || terminalRevision != _terminalRevision) {
+                  tunnelHealthy.value = false;
+                  stage.value = VpnStage.error;
+                  activeTransport.value = null;
+                  error.value =
+                      'Connection lost — protection could not be verified';
+                  if (_killSwitchEnabled) _pendingDropGeneration = generation;
+                  return;
+                }
+                _wasConnected = true;
+                tunnelHealthy.value = true;
+                _confirmedTransport = t;
+                activeTransport.value = t;
+                stage.value = VpnStage.connected;
+                error.value = null;
+                _preserveProxy = false;
+                unawaited(_probeEgressIp());
+                debugPrint(
+                  '[VPN] connected · mode=${mode.value.label} · transport=${t.label} · '
+                  'config=${t == Transport.wireguard ? "direct-wg" : "stealth-singbox"}',
+                );
                 return;
               }
-            } catch (e, st) {
-              debugPrint('[VPN] transport ${t.label} failed: $e\n$st');
+            } catch (_) {
+              debugPrint('[VPN] transport ${t.label} failed');
             }
+            if (generation != _generation) return;
             _wasConnected = false;
             if (_cancelRequested) break;
             await _ensureTunnelStopped();
           }
+          if (generation != _generation) return;
           _wasConnected = false;
           if (_cancelRequested) {
             await _finishCancelled();
             return;
           }
-          await _engine.stop().catchError((_) {});
+          await _engineOperation<void>(
+            generation,
+            () => _engine.stop(preserveProxy: _preserveProxy),
+          );
+          if (generation != _generation) return;
           _confirmedTransport = null;
           activeTransport.value = null;
-          error.value = await _connectFailureMessage();
+          final failure = await _connectFailureMessage();
+          if (generation != _generation) return;
+          error.value = failure;
           stage.value = VpnStage.error;
         } on GatewayException catch (e) {
+          if (generation != _generation) return;
           _wasConnected = false;
           if (_cancelRequested) {
             await _finishCancelled();
@@ -514,6 +766,7 @@ class VpnController extends GetxController {
           stage.value = VpnStage.error;
           break;
         } catch (e) {
+          if (generation != _generation) return;
           _wasConnected = false;
           if (_cancelRequested) {
             await _finishCancelled();
@@ -526,65 +779,85 @@ class VpnController extends GetxController {
           break;
         }
       }
+    } catch (_) {
+      if (generation == _generation) {
+        stage.value = VpnStage.error;
+        tunnelHealthy.value = false;
+        activeTransport.value = null;
+        error.value = 'Connection transition could not be verified';
+      }
     } finally {
-      _connectInProgress = false;
+      if (generation == _generation || _cancelRequested) {
+        _connectInProgress = false;
+      }
+      if (generation == _generation && _pendingDropGeneration == generation) {
+        await _drainUnexpectedDrop();
+      } else if (generation == _generation &&
+          stage.value == VpnStage.error &&
+          _preserveProxy &&
+          _killSwitchEnabled) {
+        await _engageKillSwitch();
+      }
     }
   }
 
   /// User-initiated abort of an in-flight [connect] — stops the engine and
   /// returns the UI to disconnected without surfacing an error.
   Future<void> cancelConnect() async {
-    if (!_connectInProgress) return;
+    if (!_connectInProgress && !killSwitchEngaging.value) return;
     debugPrint('[VPN] connect cancelled by user');
-    _cancelRequested = true;
-    await _engine.stop().catchError((_) {});
+    await disconnect();
   }
 
   /// Cleanup shared by every cancelled-connect exit path.
   Future<void> _finishCancelled() async {
-    await _engine.stop().catchError((_) {});
-    await _ensureTunnelStopped();
-    _confirmedTransport = null;
-    activeTransport.value = null;
-    error.value = null;
-    stage.value = VpnStage.disconnected;
-    _restorePreferredMode();
+    await disconnect();
     debugPrint('[VPN] connect aborted — back to disconnected');
   }
 
   Future<void> disconnect() async {
+    final generation = ++_generation;
     _userDisconnecting = true;
     // Also aborts any connect() still running its transport loop.
     _cancelRequested = true;
+    _preserveProxy = false;
     killSwitchBlocking.value = false;
-    stage.value = VpnStage.disconnecting;
-    try {
-      await _engine.stop();
-      stage.value = await _engine.stage();
-    } catch (_) {
-      stage.value = VpnStage.disconnected;
-    }
+    killSwitchEngaging.value = false;
     _wasConnected = false;
     _confirmedTransport = null;
     activeTransport.value = null;
     error.value = null;
     egressIp.value = null;
     egressIpLoading.value = false;
+    stage.value = VpnStage.disconnecting;
+    try {
+      await _engineOperation<void>(generation, () => _engine.stop());
+      if (generation != _generation) return;
+      final current = await _engine.stage();
+      if (generation != _generation) return;
+      if (current != VpnStage.disconnected) {
+        throw StateError('Stop not verified');
+      }
+      stage.value = VpnStage.disconnected;
+    } catch (_) {
+      if (generation != _generation) return;
+      stage.value = VpnStage.error;
+      error.value = 'Disconnect could not be verified — retry disconnect';
+    }
+    if (generation != _generation) return;
+    tunnelHealthy.value = false;
+    _userDisconnecting = false;
     _restorePreferredMode();
-    await VpnSessionStore.clear();
+    await _engineOperation<void>(generation, VpnSessionStore.clear);
   }
 
   Future<void> releaseKillSwitchIfActive() async {
-    if (!killSwitchBlocking.value) return;
-    killSwitchBlocking.value = false;
-    _wasConnected = false;
-    await _engine.stop().catchError((_) {});
-    stage.value = VpnStage.disconnected;
-    error.value = null;
-    egressIp.value = null;
-    egressIpLoading.value = false;
-    _restorePreferredMode();
-    await VpnSessionStore.clear();
+    if (!killSwitchBlocking.value &&
+        !killSwitchEngaging.value &&
+        !_preserveProxy) {
+      return;
+    }
+    await disconnect();
   }
 
   void _restorePreferredMode() {
@@ -593,17 +866,18 @@ class VpnController extends GetxController {
   }
 
   Future<void> _probeEgressIp() async {
-    if (!isConnected || killSwitchBlocking.value) return;
+    if (!isConnected || killSwitchBlocking.value || killSwitchEngaging.value) {
+      return;
+    }
     if (egressIpLoading.value) return;
+    final generation = _generation;
     egressIpLoading.value = true;
     try {
-      final ip = await EgressIpProbe.fetch(
-        useTunnelProxy: PlatformCapabilities.usesDesktopVpnRunner,
-      );
-      if (isConnected) _recordEgressResult(ip);
+      final ip = await _fetchEgress();
+      if (generation == _generation && isConnected) _recordEgressResult(ip);
       debugPrint('[VPN] egress IP probe → ${ip ?? "failed"}');
     } finally {
-      egressIpLoading.value = false;
+      if (generation == _generation) egressIpLoading.value = false;
     }
   }
 
@@ -616,7 +890,6 @@ class VpnController extends GetxController {
 
   void _startHealthMonitor() {
     _egressFailures = 0;
-    tunnelHealthy.value = true;
     _scheduleHealthCheck(const Duration(seconds: 45));
   }
 
@@ -624,18 +897,20 @@ class VpnController extends GetxController {
     _healthTimer?.cancel();
     _healthTimer = null;
     _egressFailures = 0;
-    tunnelHealthy.value = true;
+    tunnelHealthy.value = false;
   }
 
   void _scheduleHealthCheck(Duration delay) {
     _healthTimer?.cancel();
     _healthTimer = Timer(delay, () async {
-      if (!isConnected || killSwitchBlocking.value) return;
-      final ip = await EgressIpProbe.fetch(
-        timeout: const Duration(seconds: 6),
-        useTunnelProxy: PlatformCapabilities.usesDesktopVpnRunner,
-      );
-      if (!isConnected) return;
+      if (!isConnected ||
+          killSwitchBlocking.value ||
+          killSwitchEngaging.value) {
+        return;
+      }
+      final generation = _generation;
+      final ip = await _fetchEgress();
+      if (!isConnected || generation != _generation) return;
       _recordEgressResult(ip);
       // Re-check quickly while degraded so recovery/confirmation is prompt.
       _scheduleHealthCheck(Duration(seconds: _egressFailures > 0 ? 10 : 45));
@@ -651,10 +926,15 @@ class VpnController extends GetxController {
       return;
     }
     _egressFailures += 1;
+    tunnelHealthy.value = false;
+    egressIp.value = null;
     if (_egressFailures == 1) _scheduleHealthCheck(const Duration(seconds: 10));
-    if (_egressFailures >= 2 && tunnelHealthy.value) {
-      tunnelHealthy.value = false;
+    if (_egressFailures >= 2) {
       debugPrint('[VPN] tunnel up but egress failing — flagging unhealthy');
+      stage.value = VpnStage.error;
+      activeTransport.value = null;
+      error.value = 'Connection health could not be verified';
+      if (_killSwitchEnabled) unawaited(_engageKillSwitch());
     }
   }
 
@@ -669,35 +949,148 @@ class VpnController extends GetxController {
     return Get.find<AppSettingsController>().activeSplitTunnelConfig();
   }
 
-  Future<void> _engageKillSwitch() async {
-    if (killSwitchBlocking.value || !_killSwitchEnabled) return;
-    killSwitchBlocking.value = true;
-    error.value = 'Kill switch active — traffic blocked until you reconnect';
+  void _stopBlockingMonitor() {
+    ++_blockingCheckRevision;
+    _blockingTimer?.cancel();
+    _blockingTimer = null;
+  }
+
+  void _scheduleBlockingCheck() {
+    final generation = _generation;
+    final revision = _blockingCheckRevision;
+    bool isCurrent() =>
+        generation == _generation &&
+        revision == _blockingCheckRevision &&
+        killSwitchBlocking.value;
+    _blockingTimer?.cancel();
+    _blockingTimer = Timer(const Duration(seconds: 5), () async {
+      if (!isCurrent()) return;
+      if (_blockingCheckInProgress) {
+        _scheduleBlockingCheck();
+        return;
+      }
+      _blockingCheckInProgress = true;
+      bool verified;
+      try {
+        verified = await _engine.verifyBlocking();
+      } catch (_) {
+        verified = false;
+      } finally {
+        _blockingCheckInProgress = false;
+      }
+      if (!isCurrent()) return;
+      if (verified) {
+        _scheduleBlockingCheck();
+        return;
+      }
+      ++_terminalRevision;
+      killSwitchBlocking.value = false;
+      tunnelHealthy.value = false;
+      stage.value = VpnStage.error;
+      activeTransport.value = null;
+      egressIp.value = null;
+      egressIpLoading.value = false;
+      _wasConnected = false;
+      _preserveProxy = true;
+      error.value =
+          'Kill switch protection could not be verified — reconnect or disconnect to retry';
+      if (!_blockRecoveryUsed && _killSwitchEnabled) {
+        _blockRecoveryUsed = true;
+        _pendingDropGeneration = generation;
+        await _drainUnexpectedDrop();
+      }
+    });
+  }
+
+  Future<void> _engageKillSwitch({bool force = false}) async {
+    if (killSwitchBlocking.value ||
+        killSwitchEngaging.value ||
+        _userDisconnecting ||
+        _connectInProgress ||
+        (!force && !_killSwitchEnabled)) {
+      return;
+    }
+    final generation = ++_generation;
+    _preserveProxy = true;
+    _wasConnected = false;
+    killSwitchBlocking.value = false;
+    killSwitchEngaging.value = true;
     stage.value = VpnStage.error;
+    tunnelHealthy.value = false;
+    activeTransport.value = null;
+    egressIp.value = null;
+    egressIpLoading.value = false;
+    error.value = blockingMessage;
     try {
-      await _engine.stop().catchError((_) {});
-      final config = SingboxConfigBuilder.killSwitchBlockConfig();
-      await _engine.start(
-        jsonEncode(config),
-        profileName: 'Erebrus · Kill switch',
-        splitTunnel: _splitTunnelConfig(),
+      await _engineOperation<void>(
+        generation,
+        () => _engine.stop(preserveProxy: true),
       );
+      if (generation != _generation) return;
+      final config = SingboxConfigBuilder.killSwitchBlockConfig();
+      await _engineOperation<void>(
+        generation,
+        () => _engine.start(
+          jsonEncode(config),
+          profileName: 'Erebrus · Kill switch',
+          splitTunnel: _splitTunnelConfig(),
+          preserveProxy: true,
+        ),
+      );
+      if (generation != _generation) return;
+      final terminalRevision = _terminalRevision;
+      final deadline = DateTime.now().add(const Duration(seconds: 8));
+      var verified = false;
+      do {
+        verified = await _engine.verifyBlocking();
+        if (generation != _generation) return;
+        if (verified) break;
+        final current = await _engine.stage();
+        if (generation != _generation) return;
+        if (current == VpnStage.error ||
+            current == VpnStage.connected ||
+            (PlatformCapabilities.usesDesktopVpnRunner &&
+                current != VpnStage.connecting)) {
+          break;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      } while (DateTime.now().isBefore(deadline));
+      if (!verified ||
+          !_engine.isBlocking ||
+          terminalRevision != _terminalRevision) {
+        throw StateError('Blocking not verified');
+      }
+      killSwitchBlocking.value = true;
+      killSwitchEngaging.value = false;
+      error.value = blockingMessage;
       final node = selectedNode.value;
       if (node != null) {
-        await VpnSessionStore.save(
-          node: node,
-          transport: activeTransport.value ?? Transport.wireguard,
-          mode: mode.value,
-          profileName: 'Erebrus · Kill switch',
-          killSwitchActive: true,
-        );
+        await _engineOperation<void>(generation, () async {
+          await beforeSessionSave?.call();
+          if (generation != _generation) return;
+          await VpnSessionStore.save(
+            node: node,
+            transport: _confirmedTransport ?? Transport.wireguard,
+            mode: mode.value,
+            profileName: 'Erebrus · Kill switch',
+            killSwitchActive: true,
+          );
+        });
       }
+      if (generation != _generation || !killSwitchBlocking.value) return;
       debugPrint(
         '[VPN] kill switch engaged — replaced tunnel with block config',
       );
-    } catch (e) {
-      debugPrint('[VPN] kill switch engage failed: $e');
+    } catch (_) {
+      if (generation != _generation) return;
+      debugPrint('[VPN] kill switch engage failed');
       killSwitchBlocking.value = false;
+      error.value =
+          'Kill switch protection could not be verified — reconnect or disconnect to retry';
+      stage.value = VpnStage.error;
+    } finally {
+      if (generation == _generation) killSwitchEngaging.value = false;
+      await _drainUnexpectedDrop();
     }
   }
 
@@ -708,6 +1101,7 @@ class VpnController extends GetxController {
     int attempts = 40,
     Duration interval = const Duration(milliseconds: 250),
   }) async {
+    if (egressProbe != null) return true;
     final host = SingboxConfigBuilder.localProxyHost;
     final port = SingboxConfigBuilder.localProxyPort;
     for (var i = 0; i < attempts; i++) {
@@ -736,10 +1130,7 @@ class VpnController extends GetxController {
   }) async {
     for (var i = 0; i < attempts; i++) {
       if (_cancelRequested) return false;
-      final ip = await EgressIpProbe.fetch(
-        timeout: const Duration(seconds: 3),
-        useTunnelProxy: PlatformCapabilities.usesDesktopVpnRunner,
-      );
+      final ip = await _fetchEgress();
       if (ip != null) {
         debugPrint('[VPN] $label egress ready → $ip');
         return true;
@@ -769,11 +1160,17 @@ class VpnController extends GetxController {
 
   /// Fully tears down the native tunnel before the next transport attempt.
   Future<void> _ensureTunnelStopped() async {
-    final now = await _engine.stage().catchError((_) => VpnStage.disconnected);
-    if (now == VpnStage.disconnected) return;
-    await _engine.stop().catchError((_) {});
+    final generation = _generation;
+    if (_cancelRequested) return;
+    final now = await _engine.stage();
+    if (generation != _generation || now == VpnStage.disconnected) return;
+    await _engineOperation<void>(
+      generation,
+      () => _engine.stop(preserveProxy: _preserveProxy),
+    );
     for (var i = 0; i < 50; i++) {
-      final s = await _engine.stage().catchError((_) => VpnStage.disconnected);
+      if (generation != _generation) return;
+      final s = await _engine.stage();
       if (s == VpnStage.disconnected) return;
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
@@ -797,8 +1194,7 @@ class VpnController extends GetxController {
           : native;
       return 'Could not connect — $short';
     }
-    final desktop =
-        _engine.desktopPrepareError ?? SingboxDesktopRunner.instance.lastError;
+    final desktop = _engine.desktopPrepareError;
     if (desktop != null && desktop.isNotEmpty) {
       return 'Could not connect — $desktop';
     }

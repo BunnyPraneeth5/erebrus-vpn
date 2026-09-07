@@ -12,66 +12,48 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=libbox-common.sh
 source "${SCRIPT_DIR}/libbox-common.sh"
 
-BIN_ROOT="${ROOT_DIR}/bin/sing-box"
-VERSION="${SING_BOX_VERSION#v}"
+CMAKE="${CMAKE:-cmake}"
+command -v "${CMAKE}" >/dev/null 2>&1 || {
+  echo "CMake is required to fetch and verify sing-box; install CMake or set CMAKE to its executable." >&2
+  exit 1
+}
 
 fetch_one() {
-  local os="$1" arch="$2" dest_name="$3"
-  local asset="sing-box-${VERSION}-${os}-${arch}"
-  local dest="${BIN_ROOT}/${dest_name}"
-  mkdir -p "$(dirname "${dest}")"
-  echo "▸ fetching ${asset}…"
-  local work
-  work="$(mktemp -d)"
-  local bin
-  if [[ "${os}" == "windows" ]]; then
-    local url="https://github.com/SagerNet/sing-box/releases/download/${SING_BOX_VERSION}/${asset}.zip"
-    curl -fsSL "${url}" -o "${work}/${asset}.zip"
-    unzip -q "${work}/${asset}.zip" -d "${work}"
-    bin="${work}/${asset}/sing-box.exe"
-    dest="${dest}.exe"
-  else
-    local url="https://github.com/SagerNet/sing-box/releases/download/${SING_BOX_VERSION}/${asset}.tar.gz"
-    curl -fsSL "${url}" | tar -xz -C "${work}"
-    bin="${work}/${asset}/sing-box"
-  fi
-  install -m 755 "${bin}" "${dest}"
-  rm -rf "${work}"
-  echo "✓ ${dest}"
+  "${CMAKE}" "-DSINGBOX_PLATFORM=$1-$2" -P "${SCRIPT_DIR}/singbox-runtime.cmake"
+}
+
+host_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64|AMD64) echo amd64 ;;
+    arm64|aarch64) echo arm64 ;;
+    *) echo "unsupported host architecture: $(uname -m)" >&2; return 1 ;;
+  esac
 }
 
 case "${1:-host}" in
   all)
-    fetch_one darwin arm64 "darwin-arm64/sing-box"
-    fetch_one darwin amd64 "darwin-amd64/sing-box"
-    fetch_one linux amd64 "linux-amd64/sing-box"
-    fetch_one windows amd64 "windows-amd64/sing-box"
+    fetch_one darwin arm64
+    fetch_one darwin amd64
+    fetch_one linux amd64
+    fetch_one windows amd64
     ;;
   macos|darwin)
-    if [[ "$(uname -m)" == "arm64" ]]; then
-      fetch_one darwin arm64 "darwin-arm64/sing-box"
-    else
-      fetch_one darwin amd64 "darwin-amd64/sing-box"
-    fi
+    fetch_one darwin "$(host_arch)"
     ;;
   linux)
-    fetch_one linux amd64 "linux-amd64/sing-box"
+    fetch_one linux amd64
     ;;
   windows)
-    fetch_one windows amd64 "windows-amd64/sing-box"
+    fetch_one windows amd64
     ;;
-  host|*)
+  host)
+    arch="$(host_arch)"
     case "$(uname -s)" in
-      Darwin)
-        if [[ "$(uname -m)" == "arm64" ]]; then
-          fetch_one darwin arm64 "darwin-arm64/sing-box"
-        else
-          fetch_one darwin amd64 "darwin-amd64/sing-box"
-        fi
-        ;;
-      Linux) fetch_one linux amd64 "linux-amd64/sing-box" ;;
-      MINGW*|MSYS*|CYGWIN*) fetch_one windows amd64 "windows-amd64/sing-box" ;;
-      *) echo "unsupported host OS"; exit 1 ;;
+      Darwin) fetch_one darwin "${arch}" ;;
+      Linux) fetch_one linux "${arch}" ;;
+      MINGW*|MSYS*|CYGWIN*) fetch_one windows "${arch}" ;;
+      *) echo "unsupported host OS" >&2; exit 1 ;;
     esac
     ;;
+  *) echo "usage: $0 [host|all|macos|linux|windows]" >&2; exit 1 ;;
 esac

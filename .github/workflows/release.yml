@@ -168,7 +168,7 @@ jobs:
           echo "tag=v${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure build env
-        run: cp env.example .env
+        run: cp .env.example .env
 
       - run: pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
@@ -199,7 +199,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libwebkit2gtk-4.1-dev
 
       - name: Read version tag
         id: version
@@ -209,7 +209,7 @@ jobs:
           echo "tag=v${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure build env
-        run: cp env.example .env
+        run: cp .env.example .env
 
       - run: pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
@@ -247,7 +247,7 @@ jobs:
 
       - name: Configure build env
         shell: bash
-        run: cp env.example .env
+        run: cp .env.example .env
 
       - run: pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh

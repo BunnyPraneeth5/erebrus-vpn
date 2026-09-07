@@ -27,15 +27,18 @@ package_macos() {
 }
 
 package_linux() {
-  local bundle
-  bundle="$(find build/linux -maxdepth 2 -type d -name 'bundle' | head -1)"
-  if [[ -z "${bundle}" ]]; then
+  local bundle="${ROOT_DIR}/build/linux/x64/release/bundle"
+  if [[ ! -d "${bundle}" ]]; then
     echo "✗ linux bundle not found"
     exit 1
   fi
   local tag="${1:-local}"
   mkdir -p dist
   local out="dist/erebrus-vpn-linux-${tag}.tar.gz"
+  [[ -x "${bundle}/sing-box" ]] || {
+    echo "CMake did not package sing-box in ${bundle}; rebuild the Linux x64 release." >&2
+    exit 1
+  }
   tar -czf "${out}" -C "$(dirname "${bundle}")" "$(basename "${bundle}")"
   echo "✓ packaged → ${out}"
 }
@@ -50,6 +53,10 @@ package_windows() {
   mkdir -p dist
   # Absolute path — zip resolves relative paths against the cd'd runner dir.
   local out="${ROOT_DIR}/dist/erebrus-vpn-windows-${tag}.zip"
+  [[ -f "${runner_dir}/sing-box.exe" ]] || {
+    echo "CMake did not package sing-box.exe in ${runner_dir}; rebuild the Windows x64 release." >&2
+    exit 1
+  }
   (cd "${runner_dir}" && zip -qr "${out}" .)
   echo "✓ packaged → dist/erebrus-vpn-windows-${tag}.zip"
 }
@@ -61,36 +68,11 @@ read_version_tag() {
   echo "v${version_name}"
 }
 
-embed_singbox_linux() {
-  local bundle
-  bundle="$(find build/linux -maxdepth 2 -type d -name 'bundle' | head -1)"
-  if [[ -z "${bundle}" ]]; then
-    echo "✗ linux bundle not found"
-    exit 1
-  fi
-  local src="${ROOT_DIR}/bin/sing-box/linux-amd64/sing-box"
-  [[ -f "${src}" ]] || "${SCRIPT_DIR}/fetch-singbox-cli.sh" linux
-  install -m 755 "${src}" "${bundle}/sing-box"
-  echo "✓ embedded sing-box → ${bundle}/sing-box"
-}
-
-embed_singbox_windows() {
-  local runner_dir="${ROOT_DIR}/build/windows/x64/runner/Release"
-  if [[ ! -d "${runner_dir}" ]]; then
-    echo "✗ windows Release folder not found"
-    exit 1
-  fi
-  local src="${ROOT_DIR}/bin/sing-box/windows-amd64/sing-box.exe"
-  [[ -f "${src}" ]] || "${SCRIPT_DIR}/fetch-singbox-cli.sh" windows
-  install -m 755 "${src}" "${runner_dir}/sing-box.exe"
-  echo "✓ embedded sing-box → ${runner_dir}/sing-box.exe"
-}
-
 dart_define_args() {
   if [[ -f "${ROOT_DIR}/.env" ]]; then
     echo "--dart-define-from-file=${ROOT_DIR}/.env"
   else
-    echo "⚠ .env missing — cp env.example .env and set REOWN_PROJECT_ID" >&2
+    echo "⚠ .env missing — cp .env.example .env and set REOWN_PROJECT_ID" >&2
   fi
 }
 
@@ -105,6 +87,9 @@ build_one() {
     "${SCRIPT_DIR}/build-libbox-macos.sh"
     ruby "${SCRIPT_DIR}/setup-macos-tunnel.rb"
   fi
+  case "${p}" in
+    linux|windows) "${SCRIPT_DIR}/fetch-singbox-cli.sh" "${p}" ;;
+  esac
   echo "▸ flutter pub get"
   flutter pub get
   echo "▸ generate desktop brand assets"
@@ -112,10 +97,6 @@ build_one() {
   echo "▸ flutter build ${p} --release ${define_args}"
   # shellcheck disable=SC2086
   flutter build "${p}" --release ${define_args}
-  case "${p}" in
-    linux) embed_singbox_linux ;;
-    windows) embed_singbox_windows ;;
-  esac
   case "${p}" in
     macos) package_macos "${tag}" ;;
     linux) package_linux "${tag}" ;;
