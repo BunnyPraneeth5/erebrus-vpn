@@ -6,101 +6,131 @@ import 'package:flutter/foundation.dart';
 class MacosSystemProxy {
   MacosSystemProxy._();
 
-  static const _fallbackServices = [
-    'Wi-Fi',
-    'Ethernet',
-    'USB Ethernet',
-    'Thunderbolt Ethernet',
+  @visibleForTesting
+  static Future<ProcessResult> Function(String, List<String>)? runCommand;
+
+  static const _proxyKinds = [
+    'webproxy',
+    'securewebproxy',
+    'socksfirewallproxy',
   ];
+
+  static Future<String> _run(List<String> args) async {
+    final result =
+        await (runCommand?.call('networksetup', args) ??
+            Process.run('networksetup', args));
+    final output = (result.stdout as String).trim();
+    if (result.exitCode != 0 || output.toLowerCase().contains('error')) {
+      throw StateError(
+        'networksetup ${args.join(' ')} failed: $output ${result.stderr}',
+      );
+    }
+    return output;
+  }
 
   /// All enabled network services from `networksetup -listallnetworkservices`.
   static Future<List<String>> discoverNetworkServices() async {
-    try {
-      final r = await Process.run('networksetup', ['-listallnetworkservices']);
-      if (r.exitCode != 0) return List<String>.from(_fallbackServices);
-      final services = (r.stdout as String)
-          .split('\n')
-          .map((l) => l.trim())
-          .where((l) => l.isNotEmpty && !l.startsWith('*'))
-          .toList();
-      return services.isEmpty ? List<String>.from(_fallbackServices) : services;
-    } catch (e) {
-      debugPrint('[macOS] listallnetworkservices failed: $e');
-      return List<String>.from(_fallbackServices);
+    final output = await _run(['-listallnetworkservices']);
+    final services = output
+        .split('\n')
+        .map((line) => line.trim())
+        .where(
+          (line) =>
+              line.isNotEmpty &&
+              !line.startsWith('*') &&
+              !line.toLowerCase().startsWith('an asterisk'),
+        )
+        .toList();
+    if (services.isEmpty) {
+      throw StateError('No enabled macOS network services found');
     }
+    return services;
   }
 
   static Future<void> enable({
     String host = '127.0.0.1',
     int port = 10808,
   }) async {
-    if (!Platform.isMacOS) return;
+    if (!Platform.isMacOS && runCommand == null) return;
     final services = await discoverNetworkServices();
-    var enabled = 0;
+    final failures = <Object>[];
     for (final service in services) {
-      if (await _setProxy(service, host, port, enabled: true)) {
-        enabled++;
-        debugPrint('[macOS] system proxy enabled on "$service" → $host:$port');
+      for (final kind in _proxyKinds) {
+        try {
+          await _run(['-set$kind', service, host, '$port']);
+          await _run(['-set${kind}state', service, 'on']);
+        } catch (e) {
+          failures.add(e);
+        }
       }
     }
-    if (enabled == 0) {
-      debugPrint(
-        '[macOS] could not enable system proxy — check System Settings → Network '
-        '(services: ${services.join(", ")})',
+    if (failures.isNotEmpty) {
+      throw StateError('macOS proxy enable failed: $failures');
+    }
+    if (!await isEnabled(host: host, port: port)) {
+      throw StateError(
+        'macOS system proxy readback did not match requested settings',
       );
     }
+    debugPrint('[macOS] system proxy enabled → $host:$port');
+  }
+
+  static Future<bool> isEnabled({
+    String host = '127.0.0.1',
+    int port = 10808,
+  }) async {
+    if (!Platform.isMacOS && runCommand == null) return false;
+    try {
+      for (final service in await discoverNetworkServices()) {
+        for (final kind in _proxyKinds) {
+          final values = await _get(service, kind);
+          if (values['Enabled'] != 'Yes' ||
+              values['Server'] != host ||
+              values['Port'] != '$port') {
+            return false;
+          }
+        }
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<Map<String, String>> _get(String service, String kind) async {
+    final output = await _run(['-get$kind', service]);
+    final values = <String, String>{};
+    for (final line in output.split('\n')) {
+      final colon = line.indexOf(':');
+      if (colon > 0) {
+        values[line.substring(0, colon).trim()] = line
+            .substring(colon + 1)
+            .trim();
+      }
+    }
+    return values;
   }
 
   static Future<void> disable() async {
-    if (!Platform.isMacOS) return;
-    final services = await discoverNetworkServices();
-    for (final service in services) {
-      await _setProxy(service, '127.0.0.1', 10808, enabled: false);
+    if (!Platform.isMacOS && runCommand == null) return;
+    final failures = <Object>[];
+    for (final service in await discoverNetworkServices()) {
+      for (final kind in _proxyKinds) {
+        try {
+          await _run(['-set${kind}state', service, 'off']);
+          if ((await _get(service, kind))['Enabled'] != 'No') {
+            throw StateError(
+              'macOS proxy disable could not be verified: $service $kind',
+            );
+          }
+        } catch (e) {
+          failures.add(e);
+        }
+      }
+    }
+    if (failures.isNotEmpty) {
+      throw StateError('macOS proxy disable failed: $failures');
     }
     debugPrint('[macOS] system HTTP/SOCKS proxy disabled');
-  }
-
-  static Future<bool> _setProxy(
-    String service,
-    String host,
-    int port, {
-    required bool enabled,
-  }) async {
-    try {
-      if (enabled) {
-        final web = await Process.run('networksetup', [
-          '-setwebproxy',
-          service,
-          host,
-          '$port',
-        ]);
-        final secure = await Process.run('networksetup', [
-          '-setsecurewebproxy',
-          service,
-          host,
-          '$port',
-        ]);
-        final socks = await Process.run('networksetup', [
-          '-setsocksfirewallproxy',
-          service,
-          host,
-          '$port',
-        ]);
-        if (web.exitCode != 0 || secure.exitCode != 0 || socks.exitCode != 0) {
-          return false;
-        }
-        await Process.run('networksetup', ['-setwebproxystate', service, 'on']);
-        await Process.run('networksetup', ['-setsecurewebproxystate', service, 'on']);
-        await Process.run('networksetup', ['-setsocksfirewallproxystate', service, 'on']);
-      } else {
-        await Process.run('networksetup', ['-setwebproxystate', service, 'off']);
-        await Process.run('networksetup', ['-setsecurewebproxystate', service, 'off']);
-        await Process.run('networksetup', ['-setsocksfirewallproxystate', service, 'off']);
-      }
-      return true;
-    } catch (e) {
-      debugPrint('[macOS] networksetup "$service" failed: $e');
-      return false;
-    }
   }
 }

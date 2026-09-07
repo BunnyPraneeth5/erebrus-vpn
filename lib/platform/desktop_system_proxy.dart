@@ -23,7 +23,25 @@ class DesktopSystemProxy {
     }
     if (Platform.isLinux) {
       await LinuxSystemProxy.enable(host: host, port: port);
+      return;
     }
+    throw UnsupportedError('System proxy is only supported on desktop');
+  }
+
+  static Future<bool> isEnabled({
+    String host = '127.0.0.1',
+    int port = 10808,
+  }) async {
+    if (Platform.isMacOS) {
+      return MacosSystemProxy.isEnabled(host: host, port: port);
+    }
+    if (Platform.isWindows) {
+      return WindowsSystemProxy.isEnabled(host: host, port: port);
+    }
+    if (Platform.isLinux) {
+      return LinuxSystemProxy.isEnabled(host: host, port: port);
+    }
+    return false;
   }
 
   static Future<void> disable() async {

@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
+import '../../platform/platform_capabilities.dart';
 import '../../theme/app_theme.dart';
+import '../home/connect_dial.dart';
 import '../../vpn/singbox_engine.dart';
 import '../../vpn/vpn_controller.dart';
 import '../../vpn/vpn_models.dart';
@@ -18,22 +20,29 @@ class BrowserSessionStatus {
   final bool pulse;
 }
 
-BrowserSessionStatus browserSessionStatus(VpnController vpn) {
+BrowserSessionStatus browserSessionStatus(
+  VpnController vpn, {
+  bool? proxyScoped,
+}) {
   final stage = vpn.stage.value;
+  final proxy = proxyScoped ?? PlatformCapabilities.usesDesktopVpnRunner;
+  final safety = vpnSafetyStatus(vpn, proxyScoped: proxy);
 
-  if (vpn.killSwitchBlocking.value) {
-    return const BrowserSessionStatus(
-      label: 'KILL SWITCH ACTIVE',
-      tint: AppColors.danger,
-      pulse: true,
+  if (vpn.killSwitchEngaging.value ||
+      vpn.killSwitchBlocking.value ||
+      (stage == VpnStage.connected && !safety.isProtected)) {
+    return BrowserSessionStatus(
+      label: safety.label,
+      tint: safety.color,
+      pulse: vpn.killSwitchEngaging.value,
     );
   }
 
-  if (stage == VpnStage.connected) {
+  if (safety.isProtected) {
     final transport = vpn.activeTransport.value;
     final protocol = (transport?.label ?? vpn.mode.value.label).toUpperCase();
     return BrowserSessionStatus(
-      label: 'PRIVATE SESSION · $protocol',
+      label: '${proxy ? 'PROXY CONNECTED' : 'PRIVATE SESSION'} · $protocol',
       tint: AppColors.success,
       pulse: true,
     );
@@ -41,8 +50,9 @@ BrowserSessionStatus browserSessionStatus(VpnController vpn) {
 
   if (stage == VpnStage.connecting || stage == VpnStage.disconnecting) {
     final transport = vpn.activeTransport.value;
-    final hint = transport?.label.toUpperCase() ?? vpn.mode.value.label.toUpperCase();
-    final verb = stage == VpnStage.connecting ? 'SECURING' : 'STOPPING';
+    final hint =
+        transport?.label.toUpperCase() ?? vpn.mode.value.label.toUpperCase();
+    final verb = stage == VpnStage.connecting ? 'CONNECTING' : 'STOPPING';
     return BrowserSessionStatus(
       label: '$verb · $hint',
       tint: AppColors.accent,
@@ -51,7 +61,7 @@ BrowserSessionStatus browserSessionStatus(VpnController vpn) {
   }
 
   return const BrowserSessionStatus(
-    label: 'PUBLIC NETWORK',
+    label: 'NOT PROTECTED',
     tint: AppColors.warn,
     pulse: false,
   );
@@ -65,7 +75,7 @@ class BrowserSessionStrip extends StatelessWidget {
     if (!Get.isRegistered<VpnController>()) {
       return const _BrowserSessionStripBody(
         status: BrowserSessionStatus(
-          label: 'PUBLIC NETWORK',
+          label: 'NOT PROTECTED',
           tint: AppColors.warn,
           pulse: false,
         ),
@@ -78,6 +88,8 @@ class BrowserSessionStrip extends StatelessWidget {
       vpn.activeTransport.value;
       vpn.mode.value;
       vpn.killSwitchBlocking.value;
+      vpn.killSwitchEngaging.value;
+      vpn.tunnelHealthy.value;
       return _BrowserSessionStripBody(status: browserSessionStatus(vpn));
     });
   }
@@ -101,7 +113,12 @@ class _BrowserSessionStripBody extends StatelessWidget {
               status.label,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: mono(size: 11, weight: FontWeight.w500, color: status.tint, letterSpacing: 11 * 0.12),
+              style: mono(
+                size: 11,
+                weight: FontWeight.w500,
+                color: status.tint,
+                letterSpacing: 11 * 0.12,
+              ),
             ),
           ),
         ],
@@ -120,7 +137,8 @@ class _SessionDot extends StatefulWidget {
   State<_SessionDot> createState() => _SessionDotState();
 }
 
-class _SessionDotState extends State<_SessionDot> with TickerProviderStateMixin {
+class _SessionDotState extends State<_SessionDot>
+    with TickerProviderStateMixin {
   AnimationController? _controller;
 
   @override
@@ -137,7 +155,10 @@ class _SessionDotState extends State<_SessionDot> with TickerProviderStateMixin 
 
   void _syncAnimation() {
     if (widget.pulse) {
-      _controller ??= AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
+      _controller ??= AnimationController(
+        vsync: this,
+        duration: const Duration(seconds: 2),
+      )..repeat(reverse: true);
       return;
     }
     _controller?.dispose();
