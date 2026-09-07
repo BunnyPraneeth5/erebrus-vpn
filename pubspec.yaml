@@ -57,6 +57,7 @@ dependencies:
   # Intentionally mobile-only so desktop builds do not link camera APIs or
   # require camera permissions merely to support QR config import on phones.
   qr_code_scanner_plus: ^2.2.0
+  webview_win_floating: 3.0.3
 
 dev_dependencies:
   flutter_test:
@@ -69,6 +70,7 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
   flutter_launcher_icons: ^0.14.4
+  webview_flutter_platform_interface: 2.15.1
 
 flutter_launcher_icons:
   android: true

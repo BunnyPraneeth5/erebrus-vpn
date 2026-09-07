@@ -52,10 +52,36 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../scripts/singbox-runtime.cmake")
+erebrus_bundle_singbox(${BINARY_NAME} windows-amd64)
+
 
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)
+
+if(TARGET webview_win_floating_plugin)
+  add_dependencies(webview_win_floating_plugin webview_win_floating_DEPENDENCIES_DOWNLOAD)
+  target_include_directories(webview_win_floating_plugin PRIVATE
+    "${CMAKE_BINARY_DIR}/packages/Microsoft.Web.WebView2/build/native/include"
+    "${CMAKE_BINARY_DIR}/packages/Microsoft.Windows.ImplementationLibrary/include"
+  )
+  target_link_libraries(webview_win_floating_plugin PRIVATE
+    "${CMAKE_BINARY_DIR}/packages/Microsoft.Web.WebView2/build/native/x64/WebView2LoaderStatic.lib"
+    version.lib
+  )
+  set_target_properties(webview_win_floating_plugin PROPERTIES
+    VS_GLOBAL_WebView2LoaderPreference Static
+  )
+  add_dependencies(${BINARY_NAME} webview_win_floating_DEPENDENCIES_DOWNLOAD)
+  target_include_directories(${BINARY_NAME} PRIVATE
+    "${CMAKE_BINARY_DIR}/packages/Microsoft.Web.WebView2/build/native/include"
+  )
+  target_link_libraries(${BINARY_NAME} PRIVATE
+    "${CMAKE_BINARY_DIR}/packages/Microsoft.Web.WebView2/build/native/x64/WebView2LoaderStatic.lib"
+    version.lib
+  )
+endif()
 
 
 # === Installation ===
@@ -73,6 +99,8 @@ set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
 set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
 
 install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+  COMPONENT Runtime)
+install(PROGRAMS "${EREBRUS_SINGBOX_BINARY}" DESTINATION "${CMAKE_INSTALL_PREFIX}"
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
