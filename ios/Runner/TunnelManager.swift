@@ -6,6 +6,7 @@ final class TunnelManager {
     static let shared = TunnelManager()
 
     private(set) var stage: String = "disconnected"
+    @MainActor private(set) var lastError: String?
     var onStageChange: ((String) -> Void)?
 
     private var statusObserver: NSObjectProtocol?
@@ -21,16 +22,28 @@ final class TunnelManager {
     }
 
     func prepare() async -> Bool {
+        await MainActor.run { lastError = nil }
         do {
             _ = try await loadOrCreateManager()
             return true
         } catch {
+            await MainActor.run { lastError = error.localizedDescription }
             NSLog("[TunnelManager] prepare failed: \(error)")
             return false
         }
     }
 
     func start(config: String, profileName: String) async throws {
+        await MainActor.run { lastError = nil }
+        do {
+            try await startTunnel(config: config, profileName: profileName)
+        } catch {
+            await MainActor.run { lastError = error.localizedDescription }
+            throw error
+        }
+    }
+
+    private func startTunnel(config: String, profileName: String) async throws {
         setStage("connecting")
         let manager = try await loadOrCreateManager()
 
@@ -201,7 +214,12 @@ final class TunnelManager {
     }
 
     private func loadOrCreateManager() async throws -> NETunnelProviderManager {
-        if let manager = try? await loadManager() { return manager }
+        do {
+            return try await loadManager()
+        } catch {
+            let failure = error as NSError
+            guard failure.domain == "ErebrusTunnel", failure.code == 1 else { throw error }
+        }
         let manager = NETunnelProviderManager()
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = TunnelConstants.tunnelBundleId

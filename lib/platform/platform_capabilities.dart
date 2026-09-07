@@ -27,6 +27,8 @@ class PlatformCapabilities {
   static bool get isMacOS => !kIsWeb && Platform.isMacOS;
   static bool get isIOS => !kIsWeb && Platform.isIOS;
 
+  static bool get supportsEmbeddedBrowser => isMobile || isDesktop;
+
   /// Camera-based VPN configuration import is intentionally phone/tablet only.
   static bool get supportsQrScanner => isMobile;
 

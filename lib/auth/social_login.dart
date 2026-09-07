@@ -28,7 +28,7 @@ Future<bool> appleSignInSupported() async {
       return false;
     }
   }
-  return kAppleServiceId.isNotEmpty;
+  return (kIsWeb || Platform.isAndroid) && kAppleServiceId.isNotEmpty;
 }
 
 /// Runs the Google sign-in sheet and returns an id_token, or null if cancelled.
@@ -50,6 +50,11 @@ Future<String?> googleIdToken() async {
 
 /// Runs Apple sign-in and returns every value the gateway validates.
 Future<AppleLoginCredential?> appleCredential() async {
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
+    throw const SocialLoginException(
+      'Apple sign-in is not supported on this platform',
+    );
+  }
   final useWebRelay = !(Platform.isIOS || Platform.isMacOS);
   final nonce = generateNonce();
   final state = 'vpn.${generateNonce()}';
@@ -114,6 +119,7 @@ class AppleLoginCredential {
 
 /// Best-effort sign-out from the Google session (so the chooser shows next time).
 Future<void> googleSignOut() async {
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) return;
   try {
     await GoogleSignIn().signOut();
   } catch (e) {

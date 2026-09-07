@@ -32,6 +32,13 @@ void main() {
     );
   });
 
+  test('embedded browsing supports mobile and desktop platforms', () {
+    expect(
+      PlatformCapabilities.supportsEmbeddedBrowser,
+      PlatformCapabilities.isMobile || PlatformCapabilities.isDesktop,
+    );
+  });
+
   test('desktop platforms never expose the QR camera scanner', () {
     if (!PlatformCapabilities.isDesktop) return;
     expect(PlatformCapabilities.supportsQrScanner, isFalse);
