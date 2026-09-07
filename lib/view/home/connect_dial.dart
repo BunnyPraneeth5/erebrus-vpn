@@ -1,9 +1,53 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:get/get.dart';
 
+import '../../platform/platform_capabilities.dart';
 import '../../theme/app_theme.dart';
 import '../../vpn/singbox_engine.dart';
+import '../../vpn/vpn_controller.dart';
+
+class VpnSafetyStatus {
+  const VpnSafetyStatus({
+    this.label = 'NOT PROTECTED',
+    this.color = AppColors.warn,
+    this.isProtected = false,
+  });
+
+  final String label;
+  final Color color;
+  final bool isProtected;
+}
+
+VpnSafetyStatus vpnSafetyStatus(VpnController vpn, {bool? proxyScoped}) {
+  final proxy = proxyScoped ?? PlatformCapabilities.usesDesktopVpnRunner;
+  if (vpn.killSwitchEngaging.value) {
+    return VpnSafetyStatus(
+      label: proxy ? 'BLOCKING PROXY TRAFFIC' : 'BLOCKING TUNNEL TRAFFIC',
+    );
+  }
+  if (vpn.killSwitchBlocking.value) {
+    return VpnSafetyStatus(
+      label: proxy ? 'PROXY TRAFFIC BLOCKED' : 'TUNNEL TRAFFIC BLOCKED',
+      color: AppColors.danger,
+    );
+  }
+  if (vpn.isProtected) {
+    return VpnSafetyStatus(
+      label: proxy ? 'PROXY CONNECTED' : 'PROTECTED',
+      color: AppColors.success,
+      isProtected: true,
+    );
+  }
+  if (vpn.stage.value == VpnStage.connected) {
+    return const VpnSafetyStatus(
+      label: 'TUNNEL STALLED',
+      color: AppColors.danger,
+    );
+  }
+  return const VpnSafetyStatus();
+}
 
 /// Formats a duration as `MM:SS` or `H:MM:SS`.
 String fmtDuration(Duration d) {
@@ -29,12 +73,14 @@ class ConnectDial extends StatefulWidget {
     super.key,
     required this.stage,
     required this.durationLabel,
+    this.status,
     this.connectingLabel,
     this.onTap,
   });
 
   final VpnStage stage;
   final String durationLabel;
+  final VpnSafetyStatus? status;
 
   /// Status text while connecting/disconnecting (e.g. "STEALTH HANDSHAKE…").
   final String? connectingLabel;
@@ -44,11 +90,16 @@ class ConnectDial extends StatefulWidget {
   State<ConnectDial> createState() => _ConnectDialState();
 }
 
-class _ConnectDialState extends State<ConnectDial> with TickerProviderStateMixin {
-  late final AnimationController _spin =
-      AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))..repeat();
-  late final AnimationController _pulse =
-      AnimationController(vsync: this, duration: const Duration(milliseconds: 2600))..repeat();
+class _ConnectDialState extends State<ConnectDial>
+    with TickerProviderStateMixin {
+  late final AnimationController _spin = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat();
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 2600),
+  )..repeat();
 
   @override
   void dispose() {
@@ -57,11 +108,21 @@ class _ConnectDialState extends State<ConnectDial> with TickerProviderStateMixin
     super.dispose();
   }
 
-  bool get _connecting => widget.stage == VpnStage.connecting || widget.stage == VpnStage.disconnecting;
-  bool get _connected => widget.stage == VpnStage.connected;
+  bool get _connecting =>
+      widget.stage == VpnStage.connecting ||
+      widget.stage == VpnStage.disconnecting;
 
   @override
   Widget build(BuildContext context) {
+    final status = widget.status;
+    if (status != null) return _buildDial(status);
+    if (Get.isRegistered<VpnController>()) {
+      return Obx(() => _buildDial(vpnSafetyStatus(Get.find<VpnController>())));
+    }
+    return _buildDial(const VpnSafetyStatus());
+  }
+
+  Widget _buildDial(VpnSafetyStatus status) {
     const size = 240.0;
     return GestureDetector(
       onTap: widget.onTap,
@@ -76,7 +137,10 @@ class _ConnectDialState extends State<ConnectDial> with TickerProviderStateMixin
             Container(
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                border: Border.all(color: Colors.white.withValues(alpha: 0.06), width: 1.5),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.06),
+                  width: 1.5,
+                ),
               ),
             ),
             // connecting arc
@@ -85,11 +149,14 @@ class _ConnectDialState extends State<ConnectDial> with TickerProviderStateMixin
                 animation: _spin,
                 builder: (_, _) => Transform.rotate(
                   angle: _spin.value * 2 * math.pi,
-                  child: CustomPaint(size: const Size(size, size), painter: _ArcRingPainter()),
+                  child: CustomPaint(
+                    size: const Size(size, size),
+                    painter: _ArcRingPainter(),
+                  ),
                 ),
               ),
             // connected pulse rings + solid glow ring
-            if (_connected) ...[
+            if (status.isProtected) ...[
               _PulseRing(controller: _pulse, phase: 0.0),
               _PulseRing(controller: _pulse, phase: 0.5),
               Container(
@@ -97,7 +164,11 @@ class _ConnectDialState extends State<ConnectDial> with TickerProviderStateMixin
                   shape: BoxShape.circle,
                   border: Border.all(color: AppColors.accent, width: 2),
                   boxShadow: [
-                    BoxShadow(color: AppColors.accent.withValues(alpha: 0.7), blurRadius: 50, spreadRadius: -6),
+                    BoxShadow(
+                      color: AppColors.accent.withValues(alpha: 0.7),
+                      blurRadius: 50,
+                      spreadRadius: -6,
+                    ),
                   ],
                 ),
               ),
@@ -105,9 +176,11 @@ class _ConnectDialState extends State<ConnectDial> with TickerProviderStateMixin
             // center disk
             _CenterDisk(
               stage: widget.stage,
+              status: status,
               durationLabel: widget.durationLabel,
               connectingLabel: widget.connectingLabel,
-              cancellable: widget.stage == VpnStage.connecting && widget.onTap != null,
+              cancellable:
+                  widget.stage == VpnStage.connecting && widget.onTap != null,
             ),
           ],
         ),
@@ -119,26 +192,39 @@ class _ConnectDialState extends State<ConnectDial> with TickerProviderStateMixin
 class _CenterDisk extends StatelessWidget {
   const _CenterDisk({
     required this.stage,
+    required this.status,
     required this.durationLabel,
     this.connectingLabel,
     this.cancellable = false,
   });
 
   final VpnStage stage;
+  final VpnSafetyStatus status;
   final String durationLabel;
   final String? connectingLabel;
   final bool cancellable;
 
   @override
   Widget build(BuildContext context) {
-    final connected = stage == VpnStage.connected;
-    final connecting = stage == VpnStage.connecting || stage == VpnStage.disconnecting;
+    final connected = status.isProtected;
+    final connecting =
+        (stage == VpnStage.connecting || stage == VpnStage.disconnecting) &&
+        status.label == 'NOT PROTECTED';
 
     final gradient = connected
-        ? const RadialGradient(center: Alignment(0, -0.3), colors: [Color(0xFF2A1709), Color(0xFF140D08)])
+        ? const RadialGradient(
+            center: Alignment(0, -0.3),
+            colors: [Color(0xFF2A1709), Color(0xFF140D08)],
+          )
         : connecting
-            ? const RadialGradient(center: Alignment(0, -0.3), colors: [Color(0xFF1D150F), Color(0xFF0D0D11)])
-            : const RadialGradient(center: Alignment(0, -0.3), colors: [Color(0xFF18181E), Color(0xFF0D0D11)]);
+        ? const RadialGradient(
+            center: Alignment(0, -0.3),
+            colors: [Color(0xFF1D150F), Color(0xFF0D0D11)],
+          )
+        : const RadialGradient(
+            center: Alignment(0, -0.3),
+            colors: [Color(0xFF18181E), Color(0xFF0D0D11)],
+          );
 
     Widget content;
     if (connected) {
@@ -147,25 +233,59 @@ class _CenterDisk extends StatelessWidget {
         children: [
           const Icon(Icons.verified_user, size: 38, color: AppColors.accent),
           const SizedBox(height: 4),
-          Text(durationLabel, style: mono(size: 25, weight: FontWeight.w600, color: AppColors.textPrimary, letterSpacing: 0.5)),
+          Text(
+            durationLabel,
+            style: mono(
+              size: 25,
+              weight: FontWeight.w600,
+              color: AppColors.textPrimary,
+              letterSpacing: 0.5,
+            ),
+          ),
           const SizedBox(height: 2),
-          Text('PROTECTED', style: mono(size: 11, weight: FontWeight.w500, color: AppColors.accent, letterSpacing: 11 * 0.12)),
+          Text(
+            status.label,
+            textAlign: TextAlign.center,
+            style: mono(
+              size: 11,
+              weight: FontWeight.w500,
+              color: AppColors.accent,
+              letterSpacing: 11 * 0.12,
+            ),
+          ),
         ],
       );
     } else if (connecting) {
       content = Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Icon(Icons.power_settings_new, size: 40, color: AppColors.accent),
+          const Icon(
+            Icons.power_settings_new,
+            size: 40,
+            color: AppColors.accent,
+          ),
           const SizedBox(height: 9),
           Text(
             connectingLabel ?? 'SECURING…',
             textAlign: TextAlign.center,
-            style: mono(size: 12, weight: FontWeight.w500, color: AppColors.accent, letterSpacing: 12 * 0.05),
+            style: mono(
+              size: 12,
+              weight: FontWeight.w500,
+              color: AppColors.accent,
+              letterSpacing: 12 * 0.05,
+            ),
           ),
           if (cancellable) ...[
             const SizedBox(height: 5),
-            Text('TAP TO CANCEL', style: mono(size: 10, weight: FontWeight.w500, color: AppColors.textTertiary, letterSpacing: 10 * 0.08)),
+            Text(
+              'TAP TO CANCEL',
+              style: mono(
+                size: 10,
+                weight: FontWeight.w500,
+                color: AppColors.textTertiary,
+                letterSpacing: 10 * 0.08,
+              ),
+            ),
           ],
         ],
       );
@@ -173,9 +293,38 @@ class _CenterDisk extends StatelessWidget {
       content = Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.power_settings_new, size: 40, color: AppColors.textSecondary),
+          Icon(
+            Icons.power_settings_new,
+            size: 40,
+            color: AppColors.textSecondary,
+          ),
           const SizedBox(height: 9),
-          Text('TAP TO CONNECT', style: mono(size: 12, weight: FontWeight.w500, color: AppColors.textTertiary, letterSpacing: 12 * 0.05)),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Text(
+              status.label,
+              textAlign: TextAlign.center,
+              style: mono(
+                size: 11,
+                weight: FontWeight.w500,
+                color: status.color,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ),
+          if (status.label == 'NOT PROTECTED' &&
+              stage != VpnStage.connected) ...[
+            const SizedBox(height: 5),
+            Text(
+              'TAP TO CONNECT',
+              style: mono(
+                size: 10,
+                weight: FontWeight.w500,
+                color: AppColors.textTertiary,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ],
         ],
       );
     }
@@ -207,7 +356,10 @@ class _PulseRing extends StatelessWidget {
           child: Container(
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              border: Border.all(color: AppColors.accent.withValues(alpha: opacity), width: 2),
+              border: Border.all(
+                color: AppColors.accent.withValues(alpha: opacity),
+                width: 2,
+              ),
             ),
           ),
         );

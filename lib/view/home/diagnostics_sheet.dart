@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
+import '../../platform/platform_capabilities.dart';
 import '../../settings/app_settings_controller.dart';
 import '../../theme/app_theme.dart';
 import '../../vpn/vpn_controller.dart';
 import '../../vpn/vpn_models.dart';
-import 'connect_dial.dart' show fmtData;
+import 'connect_dial.dart' show fmtData, VpnSafetyStatus, vpnSafetyStatus;
 import 'node_display.dart';
 import 'sheet_chrome.dart';
 
@@ -52,7 +53,9 @@ class _DiagnosticsSheet extends StatelessWidget {
         ),
         Flexible(
           child: Obx(() {
-            final connected = vpn.isConnected;
+            final status = vpnSafetyStatus(vpn);
+            final connected = status.isProtected;
+            final proxy = PlatformCapabilities.usesDesktopVpnRunner;
             final node = vpn.selectedNode.value;
             final d = NodeDisplay.of(node);
             final stats = vpn.stats.value;
@@ -93,27 +96,16 @@ class _DiagnosticsSheet extends StatelessWidget {
                       AppColors.textSecondary,
                     ),
                     _DiagRow.text(
-                      'DNS',
-                      'Tunnel DNS → ${vpn.selectedNode.value != null ? "node resolver" : "upstream"}',
+                      proxy ? 'Proxy DNS' : 'DNS',
+                      proxy
+                          ? 'Proxied destinations only'
+                          : 'Tunnel DNS → ${vpn.selectedNode.value != null ? "node resolver" : "upstream"}',
                       AppColors.success,
                     ),
                     const _DiagRow.text('MTU', '1280', AppColors.textSecondary),
-                    _DiagRow.text(
-                      'Kill switch',
-                      (settings?.killSwitchEnabled.value ?? true)
-                          ? 'On'
-                          : 'Off',
-                      (settings?.killSwitchEnabled.value ?? true)
-                          ? AppColors.success
-                          : AppColors.textSecondary,
-                    ),
                   ]
                 : <_DiagRow>[
-                    const _DiagRow.text(
-                      'Connection',
-                      'Not connected',
-                      AppColors.danger,
-                    ),
+                    _DiagRow.text('Connection', status.label, status.color),
                     _DiagRow.text(
                       'Protocol',
                       protocolLabel,
@@ -124,19 +116,42 @@ class _DiagnosticsSheet extends StatelessWidget {
                       d.name,
                       AppColors.textSecondary,
                     ),
-                    const _DiagRow.text(
-                      'DNS',
-                      'system default',
-                      AppColors.warn,
-                    ),
+                    const _DiagRow.text('DNS', 'Not verified', AppColors.warn),
                   ];
 
             return ListView(
               padding: const EdgeInsets.fromLTRB(22, 0, 22, 30),
               shrinkWrap: true,
               children: [
-                _Banner(connected: connected),
+                _Banner(status: status, proxyScoped: proxy),
+                if (proxy)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 14),
+                    child: Text(
+                      'Only traffic using the system proxy is covered; apps that bypass it are not blocked.',
+                      style: grotesk(
+                        size: 12,
+                        weight: FontWeight.w400,
+                        color: AppColors.textSecondary,
+                      ),
+                    ),
+                  ),
                 for (final r in rows) _DiagRowWidget(row: r),
+                _DiagRowWidget(
+                  row: _DiagRow.text(
+                    'Kill switch',
+                    vpn.killSwitchEngaging.value
+                        ? 'Verifying enforcement…'
+                        : vpn.killSwitchBlocking.value
+                        ? status.label
+                        : (settings?.killSwitchEnabled.value ?? true)
+                        ? 'Enabled on unexpected drop'
+                        : 'Off',
+                    vpn.killSwitchBlocking.value
+                        ? AppColors.danger
+                        : AppColors.textSecondary,
+                  ),
+                ),
               ],
             );
           }),
@@ -279,15 +294,25 @@ class _PairStat extends StatelessWidget {
   }
 }
 
+String diagnosticsSafetyLabel(
+  VpnSafetyStatus status, {
+  required bool proxyScoped,
+}) {
+  if (!status.isProtected) return status.label;
+  return proxyScoped
+      ? 'PROXY CONNECTED · PROXIED TRAFFIC ENCRYPTED'
+      : 'TUNNEL ACTIVE · TRAFFIC ENCRYPTED';
+}
+
 class _Banner extends StatelessWidget {
-  const _Banner({required this.connected});
-  final bool connected;
+  const _Banner({required this.status, required this.proxyScoped});
+  final VpnSafetyStatus status;
+  final bool proxyScoped;
   @override
   Widget build(BuildContext context) {
-    final color = connected ? AppColors.success : AppColors.danger;
-    final label = connected
-        ? 'TUNNEL ACTIVE · TRAFFIC ENCRYPTED'
-        : 'UNPROTECTED · TRAFFIC EXPOSED';
+    final connected = status.isProtected;
+    final color = status.color;
+    final label = diagnosticsSafetyLabel(status, proxyScoped: proxyScoped);
     return Container(
       margin: const EdgeInsets.only(bottom: 14),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
@@ -309,13 +334,15 @@ class _Banner extends StatelessWidget {
                   ),
                 ),
           const SizedBox(width: 9),
-          Text(
-            label,
-            style: mono(
-              size: 12.5,
-              weight: FontWeight.w600,
-              color: color,
-              letterSpacing: 0.2,
+          Expanded(
+            child: Text(
+              label,
+              style: mono(
+                size: 12.5,
+                weight: FontWeight.w600,
+                color: color,
+                letterSpacing: 0.2,
+              ),
             ),
           ),
         ],

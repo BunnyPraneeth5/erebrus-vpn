@@ -15,6 +15,7 @@ import '../../vpn/vpn_models.dart';
 import '../browser/browser_controller.dart';
 import '../browser/browser_view.dart';
 import '../guest/guest_connect_view.dart';
+import '../home/connect_dial.dart';
 import '../home/connect_view.dart';
 import '../home/diagnostics_sheet.dart';
 import '../home/server_sheet.dart';
@@ -57,16 +58,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       ),
       const DesktopScreen(child: SettingsView()),
     ];
-    _autoConnectWorker = everAll(
-      [
-        Get.find<AppSettingsController>().autoConnectOnLaunch,
-        Get.find<WalletAuthController>().sessionReady,
-        Get.find<WalletAuthController>().entitlement,
-        Get.find<GuestConfigController>().selectedId,
-        Get.find<VpnController>().selectedNode,
-      ],
-      (_) => _tryAutoConnect(),
-    );
+    _autoConnectWorker = everAll([
+      Get.find<AppSettingsController>().autoConnectOnLaunch,
+      Get.find<WalletAuthController>().sessionReady,
+      Get.find<WalletAuthController>().entitlement,
+      Get.find<GuestConfigController>().selectedId,
+      Get.find<VpnController>().selectedNode,
+    ], (_) => _tryAutoConnect());
     WidgetsBinding.instance.addPostFrameCallback((_) => _tryAutoConnect());
     if (Get.isRegistered<BrowserController>()) {
       Get.find<BrowserController>().setShellTabVisible(false);
@@ -89,9 +87,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       if (auth.isAuthenticated) {
         unawaited(auth.refreshEntitlement());
       }
-      unawaited(vpn.syncWithNative().then((_) {
-        settings.pingDiagnosticsIfEnabled(vpn: vpn);
-      }));
+      unawaited(
+        vpn.syncWithNative().then((_) {
+          settings.pingDiagnosticsIfEnabled(vpn: vpn);
+        }),
+      );
     }
   }
 
@@ -141,9 +141,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       backgroundColor: AppColors.bg,
       body: Row(
         children: [
-          if (useSideRail) ...[
-            _DesktopSidebar(index: _index, onTap: _go),
-          ],
+          if (useSideRail) ...[_DesktopSidebar(index: _index, onTap: _go)],
           Expanded(
             child: IndexedStack(index: _index, children: _tabs),
           ),
@@ -170,7 +168,8 @@ class _HomeTab extends StatelessWidget {
               onOpenServers: () => showServerSheet(context),
               onOpenDiagnostics: () => showDiagnosticsSheet(context),
               onGoSettings: () {
-                final shell = context.findAncestorStateOfType<_MainShellState>();
+                final shell = context
+                    .findAncestorStateOfType<_MainShellState>();
                 shell?._go(2);
               },
             )
@@ -247,8 +246,20 @@ class _DesktopSidebar extends StatelessWidget {
           Obx(() {
             final vpn = Get.find<VpnController>();
             return _DesktopConnectionCard(
-              stage: vpn.stage.value,
-              transport: vpn.activeTransport.value?.label,
+              status: vpnSafetyStatus(vpn),
+              detail: vpn.killSwitchEngaging.value
+                  ? 'Verifying enforcement…'
+                  : vpn.killSwitchBlocking.value
+                  ? 'Open VPN to reconnect'
+                  : vpn.isProtected
+                  ? vpn.activeTransport.value?.label ?? 'Connection verified'
+                  : switch (vpn.stage.value) {
+                      VpnStage.connecting => 'Connecting…',
+                      VpnStage.disconnecting => 'Disconnecting…',
+                      VpnStage.connected => 'Connection health check failed',
+                      VpnStage.error => 'Connection error · open VPN to retry',
+                      _ => 'Ready to connect',
+                    },
               onTap: () => onTap(0),
             );
           }),
@@ -318,36 +329,19 @@ class _DesktopNavItem extends StatelessWidget {
 
 class _DesktopConnectionCard extends StatelessWidget {
   const _DesktopConnectionCard({
-    required this.stage,
-    required this.transport,
+    required this.status,
+    required this.detail,
     required this.onTap,
   });
 
-  final VpnStage stage;
-  final String? transport;
+  final VpnSafetyStatus status;
+  final String detail;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final (label, detail, color) = switch (stage) {
-      VpnStage.connected => (
-        'PROTECTED',
-        transport ?? 'VPN connected',
-        AppColors.success,
-      ),
-      VpnStage.connecting => (
-          'CONNECTING',
-          'Securing tunnel…',
-          AppColors.warn,
-        ),
-      VpnStage.disconnecting => (
-        'DISCONNECTING',
-        'Closing tunnel…',
-        AppColors.warn,
-      ),
-      VpnStage.error => ('CONNECTION ERROR', 'Open VPN to retry', AppColors.danger),
-      _ => ('NOT PROTECTED', 'Ready to connect', AppColors.textMuted),
-    };
+    final label = status.label;
+    final color = status.color;
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -369,8 +363,13 @@ class _DesktopConnectionCard extends StatelessWidget {
               decoration: BoxDecoration(
                 color: color,
                 shape: BoxShape.circle,
-                boxShadow: stage == VpnStage.connected
-                    ? [BoxShadow(color: color.withValues(alpha: 0.45), blurRadius: 8)]
+                boxShadow: status.isProtected
+                    ? [
+                        BoxShadow(
+                          color: color.withValues(alpha: 0.45),
+                          blurRadius: 8,
+                        ),
+                      ]
                     : null,
               ),
             ),
@@ -427,7 +426,10 @@ class _NavBar extends StatelessWidget {
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
         child: Container(
-          padding: EdgeInsets.only(top: 12, bottom: bottomInset > 0 ? bottomInset : 10),
+          padding: EdgeInsets.only(
+            top: 12,
+            bottom: bottomInset > 0 ? bottomInset : 10,
+          ),
           decoration: BoxDecoration(
             color: const Color(0xFF0A0A0C).withValues(alpha: 0.94),
             border: const Border(top: BorderSide(color: AppColors.stroke)),
@@ -448,7 +450,15 @@ class _NavBar extends StatelessWidget {
                     children: [
                       Icon(it.icon, size: 22, color: color),
                       const SizedBox(height: 5),
-                      Text(it.label, style: mono(size: 10, weight: FontWeight.w500, color: color, letterSpacing: 10 * 0.05)),
+                      Text(
+                        it.label,
+                        style: mono(
+                          size: 10,
+                          weight: FontWeight.w500,
+                          color: color,
+                          letterSpacing: 10 * 0.05,
+                        ),
+                      ),
                     ],
                   ),
                 ),
