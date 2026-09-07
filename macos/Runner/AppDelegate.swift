@@ -9,7 +9,6 @@ class AppDelegate: FlutterAppDelegate {
   let linkStreamHandler = LinkStreamHandler()
   private var eventsChannelRef: FlutterEventChannel?
   private var methodsChannelRef: FlutterMethodChannel?
-  var initialLink: String?
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     false
@@ -17,14 +16,6 @@ class AppDelegate: FlutterAppDelegate {
 
   override func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
     true
-  }
-
-  override func applicationDidFinishLaunching(_ notification: Notification) {
-    if let url = NSAppleEventManager.shared().currentAppleEvent?
-      .paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?
-      .stringValue, url.hasPrefix("erebrusvpn://") {
-      initialLink = url
-    }
   }
 
   override func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -59,12 +50,8 @@ class AppDelegate: FlutterAppDelegate {
       name: AppDelegate.methodsChannel,
       binaryMessenger: messenger
     )
-    methodsChannelRef?.setMethodCallHandler { [weak self] call, result in
+    methodsChannelRef?.setMethodCallHandler { call, result in
       if call.method == "initialLink" {
-        if let link = self?.initialLink {
-          _ = self?.linkStreamHandler.handleLink(link)
-          self?.initialLink = nil
-        }
         result(nil)
       } else {
         result(FlutterMethodNotImplemented)
@@ -73,9 +60,9 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   override func application(_ application: NSApplication, open urls: [URL]) {
-    for url in urls {
-      if linkStreamHandler.handleLink(url.absoluteString) { continue }
-      initialLink = url.absoluteString
+    let remaining = urls.filter { !linkStreamHandler.handleLink($0.absoluteString) }
+    if !remaining.isEmpty {
+      super.application(application, open: remaining)
     }
   }
 
@@ -97,13 +84,22 @@ class AppDelegate: FlutterAppDelegate {
 }
 
 final class LinkStreamHandler: NSObject, FlutterStreamHandler {
-  var eventSink: FlutterEventSink?
-  var queuedLinks = [String]()
+  private var eventSink: FlutterEventSink?
+  private var queuedLinks = [String]()
+
+  static func ownsURL(_ url: URL) -> Bool {
+    if url.scheme?.lowercased() == "erebrusvpn" { return true }
+    return url.scheme?.lowercased() == "https" &&
+      url.host?.lowercased() == "erebrus.io" &&
+      (url.port == nil || url.port == 443) &&
+      url.user == nil && url.password == nil && url.path == "/vpn"
+  }
 
   func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
     self.eventSink = events
-    queuedLinks.forEach { events($0) }
+    let pending = queuedLinks
     queuedLinks.removeAll()
+    pending.forEach { events($0) }
     return nil
   }
 
@@ -113,11 +109,12 @@ final class LinkStreamHandler: NSObject, FlutterStreamHandler {
   }
 
   func handleLink(_ link: String) -> Bool {
-    guard let eventSink else {
+    guard let url = URL(string: link), Self.ownsURL(url) else { return false }
+    if let eventSink {
+      eventSink(link)
+    } else {
       queuedLinks.append(link)
-      return false
     }
-    eventSink(link)
     return true
   }
 }

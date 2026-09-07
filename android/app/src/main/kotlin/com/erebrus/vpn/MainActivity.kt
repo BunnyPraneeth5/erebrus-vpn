@@ -131,8 +131,14 @@ class MainActivity : FlutterActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         if (intent.action == Intent.ACTION_VIEW) {
-            linksReceiver?.onReceive(applicationContext, intent)
+            val receiver = linksReceiver
+            if (receiver == null) {
+                intent.dataString?.let { initialLink = it }
+            } else {
+                receiver.onReceive(applicationContext, intent)
+            }
         }
     }
 

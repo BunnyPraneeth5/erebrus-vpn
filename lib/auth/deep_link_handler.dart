@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
@@ -10,6 +12,13 @@ class DeepLinkHandler {
   static const _eventChannel = EventChannel('com.erebrus.vpn/events');
 
   static WalletAuthController? _auth;
+  static String? _pendingLink;
+
+  @visibleForTesting
+  static void resetForTesting() {
+    _auth = null;
+    _pendingLink = null;
+  }
 
   static void initListener() {
     if (kIsWeb) return;
@@ -23,12 +32,20 @@ class DeepLinkHandler {
   static void bind(WalletAuthController auth) {
     if (kIsWeb) return;
     _auth = auth;
+    final pendingLink = _pendingLink;
+    _pendingLink = null;
+    if (pendingLink != null) {
+      unawaited(_onLink(pendingLink).catchError(_onError));
+    }
   }
 
-  static void checkInitialLink() {
+  static Future<void> checkInitialLink() async {
     if (kIsWeb) return;
     try {
-      _methodChannel.invokeMethod<void>('initialLink');
+      final link = await _methodChannel.invokeMethod<String>('initialLink');
+      await _onLink(link);
+    } on MissingPluginException {
+      return;
     } catch (e) {
       debugPrint('[DeepLinkHandler] checkInitialLink $e');
     }
@@ -39,6 +56,7 @@ class DeepLinkHandler {
     final url = link.toString();
     final auth = _auth;
     if (auth == null) {
+      _pendingLink = url;
       debugPrint('[DeepLinkHandler] auth not bound for $url');
       return;
     }

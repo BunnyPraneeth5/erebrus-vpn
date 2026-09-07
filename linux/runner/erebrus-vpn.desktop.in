@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Erebrus VPN
+Exec=sh -c "exec \\"\\$(dirname -- \\"\\$(readlink -f -- \\"\\$1\\")\\")/../../@BINARY_NAME@\\" \\"\\$2\\"" sh %k %u
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+MimeType=x-scheme-handler/erebrusvpn;
+StartupNotify=true
+StartupWMClass=@APPLICATION_ID@
+DBusActivatable=false
