@@ -41,11 +41,65 @@ void main() {
     expect(msg, contains('9080'));
   });
 
-  test('friendlyGatewayError maps subscription gate', () {
+  test('friendlyGatewayError maps missing workspace without trial copy', () {
     final msg = friendlyGatewayError(
-      GatewayException('no active subscription — start a trial or subscribe'),
+      GatewayException(
+        'active organization membership is required to use public nodes',
+        statusCode: 402,
+        code: 'ENTITLEMENT_REQUIRED',
+      ),
     );
-    expect(msg, contains('free trial'));
+    expect(msg, isNot(contains('trial')));
+    expect(msg, contains('workspace'));
+  });
+
+  test('friendlyGatewayError explains the plan device limit with numbers', () {
+    const body =
+        '{"error":"device limit reached for your plan","code":"VPN_DEVICE_LIMIT","details":{"limit":3,"used":3,"plan_id":"personal.starter"}}';
+    final msg = friendlyGatewayError(
+      GatewayException(
+        GatewayHttp.errorMessage(409, body),
+        statusCode: 409,
+        code: GatewayHttp.errorCode(body),
+        details: GatewayHttp.errorDetails(body),
+      ),
+    );
+    expect(msg, contains('3/3'));
+    expect(msg, contains('erebrus.io/pricing'));
+  });
+
+  test('friendlyGatewayError explains paused devices and billing holds', () {
+    expect(
+      friendlyGatewayError(
+        GatewayException('paused', statusCode: 409, code: 'VPN_DEVICE_PAUSED'),
+      ),
+      contains('paused'),
+    );
+    expect(
+      friendlyGatewayError(
+        GatewayException('suspended', statusCode: 402, code: 'BILLING_ACCESS_REQUIRED'),
+      ),
+      contains('billing'),
+    );
+  });
+
+  test('a draining node is not reported as a device limit', () {
+    final msg = friendlyGatewayError(
+      GatewayException('node is draining', statusCode: 409, code: 'NODE_DRAINING'),
+      nodeName: 'fra-1',
+    );
+    expect(msg, contains('fra-1'));
+    expect(msg, isNot(contains('limit')));
+  });
+
+  test('gateway client rows mark plan-paused devices', () {
+    final row = VpnClientRow.fromJson({
+      'id': 'c1',
+      'node_id': 'n1',
+      'wg_public_key': 'k',
+      'status': 'suspended_plan_limit',
+    });
+    expect(row.isPlanPaused, isTrue);
   });
 
   test('friendlyGatewayError maps tier gate', () {

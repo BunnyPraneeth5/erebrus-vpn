@@ -181,6 +181,18 @@ abstract final class GatewayHttp {
     return null;
   }
 
+  /// Optional `details` object from the gateway error envelope (e.g. the
+  /// device `limit` / `used` counts on VPN_DEVICE_LIMIT).
+  static Map<String, dynamic>? errorDetails(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map && decoded['details'] is Map) {
+        return Map<String, dynamic>.from(decoded['details'] as Map);
+      }
+    } catch (_) {}
+    return null;
+  }
+
   static Uri normalizeBase(String url) {
     final trimmed = url.trim();
     final withScheme = trimmed.contains('://') ? trimmed : 'https://$trimmed';

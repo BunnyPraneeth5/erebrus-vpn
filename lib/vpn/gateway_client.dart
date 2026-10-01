@@ -199,6 +199,7 @@ class GatewayClient {
             GatewayHttp.errorMessage(res.statusCode, text),
             statusCode: res.statusCode,
             code: GatewayHttp.errorCode(text),
+            details: GatewayHttp.errorDetails(text),
           );
           if (hadBearer && error.isSessionExpired) {
             // Do not await here: a 401 may originate inside GatewayController's
@@ -237,10 +238,13 @@ class GatewayClient {
 }
 
 class GatewayException implements Exception {
-  GatewayException(this.message, {this.statusCode, this.code});
+  GatewayException(this.message, {this.statusCode, this.code, this.details});
   final String message;
   final int? statusCode;
   final String? code;
+
+  /// Optional structured details from the gateway (e.g. device limit counts).
+  final Map<String, dynamic>? details;
 
   bool get isSessionExpired => statusCode == HttpStatus.unauthorized;
 
@@ -261,6 +265,9 @@ class VpnClientRow {
   final String nodeId;
   final String wgPublicKey;
   final String status;
+
+  /// Paused by the gateway because the plan no longer covers this device.
+  bool get isPlanPaused => status == 'suspended_plan_limit';
 
   factory VpnClientRow.fromJson(Map<String, dynamic> j) => VpnClientRow(
     id: (j['id'] ?? '').toString(),
