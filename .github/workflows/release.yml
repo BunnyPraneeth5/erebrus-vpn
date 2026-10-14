@@ -2,6 +2,9 @@ name: Release
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - build/ci-test-builds
 
 permissions:
   contents: write
