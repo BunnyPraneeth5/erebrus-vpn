@@ -114,6 +114,16 @@ jobs:
             -storepass ci-sideload -keypass ci-sideload \
             -dname "CN=Erebrus VPN CI, OU=Sideload, O=NetSepio, L=CI, ST=CI, C=US"
 
+      - name: Configure build env
+        shell: bash
+        env:
+          REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+        run: |
+          {
+            echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
+            echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
+            echo "GATEWAY_URL=https://gateway.erebrus.io"
+          } > .env
       - run: flutter pub get
 
       - name: Build release APKs
@@ -168,7 +178,15 @@ jobs:
           echo "tag=v${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure build env
-        run: cp .env.example .env
+        shell: bash
+        env:
+          REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+        run: |
+          {
+            echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
+            echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
+            echo "GATEWAY_URL=https://gateway.erebrus.io"
+          } > .env
 
       - run: pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
@@ -209,7 +227,15 @@ jobs:
           echo "tag=v${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure build env
-        run: cp .env.example .env
+        shell: bash
+        env:
+          REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+        run: |
+          {
+            echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
+            echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
+            echo "GATEWAY_URL=https://gateway.erebrus.io"
+          } > .env
 
       - run: pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
@@ -247,7 +273,15 @@ jobs:
 
       - name: Configure build env
         shell: bash
-        run: cp .env.example .env
+        env:
+          REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+        run: |
+          {
+            echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
+            echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
+            echo "GATEWAY_URL=https://gateway.erebrus.io"
+          } > .env
+      
 
       - run: pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
