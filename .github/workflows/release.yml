@@ -91,6 +91,11 @@ jobs:
           "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358"
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/28.2.13676358" >> "${GITHUB_ENV}"
 
+      - name: Pre-install pinned gobind
+        run: |
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260611195102-4dd8f1dbf5d2
+          echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
+
       - name: Build libbox
         run: ./scripts/build-libbox.sh
 
@@ -196,6 +201,11 @@ jobs:
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
           } > .env
+
+      - name: Pre-install pinned gobind
+        run: |
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260611195102-4dd8f1dbf5d2
+          echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
 
       - run: pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
