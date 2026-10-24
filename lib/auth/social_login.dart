@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:sign_in_with_apple/sign_in_with_apple.dart';
 
@@ -38,7 +39,13 @@ Future<String?> googleIdToken() async {
     serverClientId: RuntimeConfig.googleServerClientId,
     scopes: const ['email'],
   );
-  final account = await google.signIn();
+  final GoogleSignInAccount? account;
+  try {
+    account = await google.signIn();
+  } on PlatformException catch (e) {
+    if (e.code == 'sign_in_canceled') return null;
+    throw SocialLoginException(googleSignInErrorMessage(e));
+  }
   if (account == null) return null; // user dismissed the chooser
   final auth = await account.authentication;
   final token = auth.idToken;
@@ -46,6 +53,27 @@ Future<String?> googleIdToken() async {
     throw const SocialLoginException('Google did not return an identity token');
   }
   return token;
+}
+
+/// Maps Google Play services `ApiException` status codes to readable text.
+/// Code 10 (DEVELOPER_ERROR) means this build's signing-certificate SHA-1 is
+/// not registered for the app's Android OAuth client in Google Cloud.
+@visibleForTesting
+String googleSignInErrorMessage(PlatformException e) {
+  final detail = '${e.code} ${e.message ?? ''}';
+  final status = RegExp(r'ApiException:\s*(\d+)').firstMatch(detail)?.group(1);
+  debugPrint('[Auth] google sign-in failed: $detail');
+  return switch (status) {
+    '10' =>
+      'Google sign-in isn\'t set up for this build yet. '
+          'Please sign in with email for now.',
+    '7' => 'Google sign-in needs an internet connection. Check it and retry.',
+    '12500' =>
+      'Google sign-in failed on this device. Update Google Play services '
+          'and try again.',
+    _ => 'Google sign-in failed${status == null ? '' : ' (code $status)'}. '
+        'Please try again or use email.',
+  };
 }
 
 /// Runs Apple sign-in and returns every value the gateway validates.

@@ -46,7 +46,6 @@ jobs:
       - run: flutter pub get
       - run: flutter analyze
       - run: flutter test
-        continue-on-error: true
 
   build-android:
     needs: verify
@@ -99,31 +98,44 @@ jobs:
       - name: Build libbox
         run: ./scripts/build-libbox.sh
 
-      - name: Configure ephemeral signing (sideload builds only)
+      # Google Sign-In only accepts APKs whose signing-certificate SHA-1 is
+      # registered for com.erebrus.vpn in Google Cloud, so sideload builds need
+      # one stable key. Store it as ANDROID_SIDELOAD_KEYSTORE_B64 (base64 of a
+      # PKCS12 keystore, alias erebrus-vpn-sideload) +
+      # ANDROID_SIDELOAD_KEYSTORE_PASSWORD. Without them we fall back to a
+      # throwaway key: the APK installs, but Google login fails (code 10).
+      - name: Configure sideload signing
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_SIDELOAD_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_SIDELOAD_KEYSTORE_PASSWORD }}
         run: |
           mkdir -p android/release-keys
-          cat > android/key.properties <<'EOF'
-          playstore.storeFile=../release-keys/erebrus-vpn-playstore.jks
-          playstore.storePassword=ci-sideload
-          playstore.keyAlias=erebrus-vpn-playstore
-          playstore.keyPassword=ci-sideload
-          dappstore.storeFile=../release-keys/erebrus-vpn-dappstore.jks
-          dappstore.storePassword=ci-sideload
-          dappstore.keyAlias=erebrus-vpn-dappstore
-          dappstore.keyPassword=ci-sideload
-          EOF
-          keytool -genkeypair -v \
-            -keystore android/release-keys/erebrus-vpn-playstore.jks \
-            -alias erebrus-vpn-playstore \
-            -keyalg RSA -keysize 2048 -validity 1 \
-            -storepass ci-sideload -keypass ci-sideload \
-            -dname "CN=Erebrus VPN CI, OU=Sideload, O=NetSepio, L=CI, ST=CI, C=US"
-          keytool -genkeypair -v \
-            -keystore android/release-keys/erebrus-vpn-dappstore.jks \
-            -alias erebrus-vpn-dappstore \
-            -keyalg RSA -keysize 2048 -validity 1 \
-            -storepass ci-sideload -keypass ci-sideload \
-            -dname "CN=Erebrus VPN CI, OU=Sideload, O=NetSepio, L=CI, ST=CI, C=US"
+          KS=android/release-keys/erebrus-vpn-sideload.p12
+          if [[ -n "${KEYSTORE_B64}" && -n "${KEYSTORE_PASSWORD}" ]]; then
+            echo "${KEYSTORE_B64}" | base64 --decode > "${KS}"
+            PASS="${KEYSTORE_PASSWORD}"
+            echo "Using stable sideload signing key from secrets"
+          else
+            echo "::warning::ANDROID_SIDELOAD_KEYSTORE_B64/PASSWORD not set — signing with a throwaway key. Google Sign-In will fail (ApiException 10) on this build."
+            PASS=ci-sideload
+            keytool -genkeypair \
+              -storetype PKCS12 -keystore "${KS}" \
+              -alias erebrus-vpn-sideload \
+              -keyalg RSA -keysize 2048 -validity 1 \
+              -storepass "${PASS}" -keypass "${PASS}" \
+              -dname "CN=Erebrus VPN CI, OU=Sideload, O=NetSepio, L=CI, ST=CI, C=US"
+          fi
+          {
+            for flavor in playstore dappstore; do
+              echo "${flavor}.storeFile=../release-keys/erebrus-vpn-sideload.p12"
+              echo "${flavor}.storePassword=${PASS}"
+              echo "${flavor}.keyAlias=erebrus-vpn-sideload"
+              echo "${flavor}.keyPassword=${PASS}"
+            done
+          } > android/key.properties
+          echo "Signing certificate SHA-1 (register this for com.erebrus.vpn in Google Cloud):"
+          keytool -list -v -keystore "${KS}" -storepass "${PASS}" -alias erebrus-vpn-sideload | grep -E "SHA1:" || true
 
       - name: Configure build env
         shell: bash
@@ -135,6 +147,9 @@ jobs:
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
           } > .env
+          if [[ -z "${REOWN_PROJECT_ID}" ]]; then
+            echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
+          fi
 
       - run: flutter pub get
 
@@ -201,13 +216,21 @@ jobs:
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
           } > .env
+          if [[ -z "${REOWN_PROJECT_ID}" ]]; then
+            echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
+          fi
 
       - name: Pre-install pinned gobind
         run: |
           go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260611195102-4dd8f1dbf5d2
           echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
 
-      - run: pip install pillow
+      # One interpreter for install and run: the runner's bare `pip` targets a
+      # different Python than `python3`, so Pillow went missing.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
       - run: ./scripts/build-desktop.sh macos
 
@@ -255,8 +278,14 @@ jobs:
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
           } > .env
+          if [[ -z "${REOWN_PROJECT_ID}" ]]; then
+            echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
+          fi
 
-      - run: pip install pillow
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
       - run: ./scripts/build-desktop.sh linux
 
@@ -270,6 +299,11 @@ jobs:
     needs: verify
     runs-on: windows-latest
     timeout-minutes: 60
+    # The runner default is PowerShell, which hands `./scripts/*.sh` to the
+    # file association instead of running it — the build silently did nothing.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -300,8 +334,14 @@ jobs:
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
           } > .env
+          if [[ -z "${REOWN_PROJECT_ID}" ]]; then
+            echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
+          fi
 
-      - run: pip install pillow
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pillow
       - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
       - run: ./scripts/build-desktop.sh windows
 

@@ -18,14 +18,16 @@ void main() {
 
     final n = nodes.first;
     expect(n.name, isNotEmpty);
-    expect(n.zone, isNotEmpty);
-    expect(n.org?.name, isNotEmpty);
+    expect(n.region, isNotEmpty);
     expect(n.walletAddress, isNotEmpty);
     expect(n.chain, isNotEmpty);
+    // `zone` and `org` are optional in the live registry (public nodes such
+    // as erebrus-Crypto ship region only); assert them only when present.
+    if (n.org != null) expect(n.org!.name, isNotEmpty);
 
     final d = NodeDisplay.of(n, showActivity: true);
     expect(d.regionCompact, isNotEmpty);
-    expect(d.org?.name, isNotEmpty);
+    if (d.org != null) expect(d.org!.name, isNotEmpty);
     expect(d.showSolanaBadge, n.chain?.toLowerCase() == 'solana');
   }, skip: false);
 }

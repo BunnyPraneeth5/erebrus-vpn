@@ -284,7 +284,7 @@ class WalletAuthController extends GetxController {
       return;
     }
     if (!RuntimeConfig.hasReownProjectId) {
-      authError.value = kReownProjectIdMissingMessage;
+      // Reported when a wallet button is tapped, not on launch.
       reownReady.value = false;
       debugPrint('[Reown] init skipped — REOWN_PROJECT_ID not configured');
       return;
@@ -514,6 +514,10 @@ class WalletAuthController extends GetxController {
 
   Future<void> openWalletModal() async {
     authError.value = null;
+    if (!RuntimeConfig.hasReownProjectId) {
+      authError.value = kReownProjectIdMissingMessage;
+      return;
+    }
     if (appKitModal == null || !reownReady.value) {
       authError.value =
           'Wallet connect is still starting — try again in a moment';

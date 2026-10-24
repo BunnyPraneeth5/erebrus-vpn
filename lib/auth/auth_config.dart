@@ -82,10 +82,11 @@ const kErebrusNativeRedirect = 'erebrusvpn://';
 /// Universal link placeholder for Reown metadata (host assetlinks when ready).
 const kErebrusUniversalRedirect = 'https://erebrus.io/vpn';
 
-/// Shown when Reown init runs without a project id in the build environment.
+/// Shown when a wallet button is tapped in a build without REOWN_PROJECT_ID
+/// (set it in `.env` or the `REOWN_PROJECT_ID` CI secret, then rebuild).
 const kReownProjectIdMissingMessage =
-    'REOWN_PROJECT_ID is not set. Add it to .env in the project root '
-    '(cp env.example .env), then rebuild the app.';
+    'Wallet login isn\'t available in this build yet. '
+    'Please sign in with email for now.';
 
 /// macOS / iOS bundle id — sent to the webapp as `client_id`.
 const kErebrusBundleId = 'com.erebrus.vpn';
