@@ -15,6 +15,10 @@ const kGoogleServerClientId = String.fromEnvironment('GOOGLE_SERVER_CLIENT_ID');
 const kDefaultGoogleServerClientId =
     '743089346496-15iub9ug9b4jkqonokg2js80ndjv8nba.apps.googleusercontent.com';
 
+/// `--dart-define=GOOGLE_LOGIN_ENABLED=true` override; see
+/// [RuntimeConfig.googleLoginEnabled].
+const kGoogleLoginEnabledDefine = String.fromEnvironment('GOOGLE_LOGIN_ENABLED');
+
 /// Bundle-specific Google OAuth client for `com.erebrus.vpn`. OAuth client IDs
 /// are public app identifiers, so this is intentionally checked into source.
 const kGoogleIosClientId =

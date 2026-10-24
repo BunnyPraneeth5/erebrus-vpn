@@ -141,11 +141,15 @@ jobs:
         shell: bash
         env:
           REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+          # Repo variable; set to "true" once the Android OAuth client for the
+          # signing key's SHA-1 exists in Google Cloud. Unset hides the button.
+          GOOGLE_LOGIN_ENABLED: ${{ vars.GOOGLE_LOGIN_ENABLED }}
         run: |
           {
             echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
+            echo "GOOGLE_LOGIN_ENABLED=${GOOGLE_LOGIN_ENABLED}"
           } > .env
           if [[ -z "${REOWN_PROJECT_ID}" ]]; then
             echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
@@ -188,18 +192,39 @@ jobs:
     env:
       GOTOOLCHAIN: local
     steps:
+      # The macOS app embeds the ErebrusTunnel Network Extension, which Xcode
+      # only builds with NetSepio's Apple Developer team (76KW3AMAW5) signing
+      # and provisioning profiles. Until those are available to CI, skip the
+      # build (job stays green) instead of failing on "No profiles found".
+      # Set the repo variable ENABLE_MACOS_BUILD=true once signing is set up.
+      - name: Check macOS signing availability
+        id: gate
+        env:
+          ENABLED: ${{ vars.ENABLE_MACOS_BUILD }}
+        run: |
+          if [[ "${ENABLED}" == "true" ]]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::macOS build skipped — needs Apple Developer signing for team 76KW3AMAW5. Set repo variable ENABLE_MACOS_BUILD=true once it is configured."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.enabled == 'true'
 
       - uses: actions/setup-go@v5
+        if: steps.gate.outputs.enabled == 'true'
         with:
           go-version: "1.25"
 
       - uses: subosito/flutter-action@v2
+        if: steps.gate.outputs.enabled == 'true'
         with:
           channel: stable
           cache: true
 
       - name: Read version tag
+        if: steps.gate.outputs.enabled == 'true'
         id: version
         run: |
           VERSION_LINE="$(grep '^version:' pubspec.yaml | awk '{print $2}')"
@@ -207,20 +232,24 @@ jobs:
           echo "tag=v${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure build env
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         env:
           REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+          GOOGLE_LOGIN_ENABLED: ${{ vars.GOOGLE_LOGIN_ENABLED }}
         run: |
           {
             echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
+            echo "GOOGLE_LOGIN_ENABLED=${GOOGLE_LOGIN_ENABLED}"
           } > .env
           if [[ -z "${REOWN_PROJECT_ID}" ]]; then
             echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
           fi
 
       - name: Pre-install pinned gobind
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260611195102-4dd8f1dbf5d2
           echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
@@ -228,13 +257,18 @@ jobs:
       # One interpreter for install and run: the runner's bare `pip` targets a
       # different Python than `python3`, so Pillow went missing.
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.enabled == 'true'
         with:
           python-version: "3.12"
-      - run: python -m pip install pillow
-      - run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
-      - run: ./scripts/build-desktop.sh macos
+      - if: steps.gate.outputs.enabled == 'true'
+        run: python -m pip install pillow
+      - if: steps.gate.outputs.enabled == 'true'
+        run: chmod +x scripts/build-desktop.sh scripts/fetch-singbox-cli.sh
+      - if: steps.gate.outputs.enabled == 'true'
+        run: ./scripts/build-desktop.sh macos
 
       - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.enabled == 'true'
         with:
           name: macos-${{ steps.version.outputs.tag }}
           if-no-files-found: error
@@ -272,11 +306,15 @@ jobs:
         shell: bash
         env:
           REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+          # Repo variable; set to "true" once the Android OAuth client for the
+          # signing key's SHA-1 exists in Google Cloud. Unset hides the button.
+          GOOGLE_LOGIN_ENABLED: ${{ vars.GOOGLE_LOGIN_ENABLED }}
         run: |
           {
             echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
+            echo "GOOGLE_LOGIN_ENABLED=${GOOGLE_LOGIN_ENABLED}"
           } > .env
           if [[ -z "${REOWN_PROJECT_ID}" ]]; then
             echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
@@ -328,11 +366,15 @@ jobs:
         shell: bash
         env:
           REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+          # Repo variable; set to "true" once the Android OAuth client for the
+          # signing key's SHA-1 exists in Google Cloud. Unset hides the button.
+          GOOGLE_LOGIN_ENABLED: ${{ vars.GOOGLE_LOGIN_ENABLED }}
         run: |
           {
             echo "REOWN_PROJECT_ID=${REOWN_PROJECT_ID}"
             echo "EREBRUS_WEB_ORIGIN=https://erebrus.io"
             echo "GATEWAY_URL=https://gateway.erebrus.io"
+            echo "GOOGLE_LOGIN_ENABLED=${GOOGLE_LOGIN_ENABLED}"
           } > .env
           if [[ -z "${REOWN_PROJECT_ID}" ]]; then
             echo "::warning::REOWN_PROJECT_ID secret is empty — wallet login (Reown/WalletConnect) will be unavailable in this build."
@@ -369,20 +411,37 @@ jobs:
           echo "version_code=${VERSION_CODE}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
 
+      # Publish once per version: a pubspec version that already has a tag is
+      # never re-tagged or overwritten — bump `version:` to publish a new one.
+      # Pushes with an unchanged version still build and upload CI artifacts.
+      - name: Check whether this version is already released
+        id: existing
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${TAG} is already released — skipping publish. Bump version in pubspec.yaml to publish a new release."
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Create and push tag
+        if: steps.existing.outputs.exists == 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -fa "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}" --force
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
 
       - uses: actions/download-artifact@v4
+        if: steps.existing.outputs.exists == 'false'
         with:
           pattern: "*-${{ steps.version.outputs.tag }}"
           merge-multiple: true
           path: dist
 
       - uses: softprops/action-gh-release@v2
+        if: steps.existing.outputs.exists == 'false'
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Erebrus VPN ${{ steps.version.outputs.version_name }}

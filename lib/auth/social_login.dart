@@ -17,7 +17,8 @@ import 'runtime_config.dart';
 /// id while the returned token targets the configured gateway/server client.
 bool get googleSignInSupported =>
     RuntimeConfig.googleServerClientId.isNotEmpty &&
-    (Platform.isAndroid || (Platform.isIOS && kGoogleIosClientId.isNotEmpty));
+    ((Platform.isAndroid && RuntimeConfig.googleLoginEnabled) ||
+        (Platform.isIOS && kGoogleIosClientId.isNotEmpty));
 
 /// Whether Apple sign-in can run: native on iOS/macOS, or a configured Services
 /// id elsewhere.
