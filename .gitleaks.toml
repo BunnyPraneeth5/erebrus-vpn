@@ -3,8 +3,10 @@
 useDefault = true
 
 [allowlist]
-description = "env templates, docs, signing examples, and release key paths"
+description = "env templates, docs, signing examples, release key paths, and CocoaPods lockfiles"
 paths = [
+  # SPEC CHECKSUMS entries (e.g. `AppAuth: <sha1>`) trip generic-api-key.
+  '''(^|/)Podfile\.lock$''',
   '''\.env\.example$''',
   '''docs/.*''',
   '''android/key\.properties\.example$''',
