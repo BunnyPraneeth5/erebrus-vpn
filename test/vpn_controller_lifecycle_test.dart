@@ -372,7 +372,7 @@ void main() {
   );
 
   test(
-    'VPN exit during delayed snapshot save stays unprotected and defers engagement',
+    'VPN exit during first connect stays unprotected and releases the tunnel',
     () async {
       final saving = Completer<void>();
       controller.onClose();
@@ -413,11 +413,13 @@ void main() {
       saving.complete();
       await connection;
       await flush();
-      expect(engine.starts, 2);
-      expect(controller.killSwitchBlocking.value, isTrue);
+      // Never protected before this attempt: no kill switch, tunnel and
+      // system proxy are released so login/gateway calls keep working.
+      expect(engine.starts, 1);
+      expect(controller.killSwitchBlocking.value, isFalse);
       expect(controller.isProtected, isFalse);
       expect(controller.activeTransport.value, isNull);
-      expect(engine.stopPreserved, everyElement(isTrue));
+      expect(engine.stopPreserved.last, isFalse);
     },
   );
 
@@ -638,6 +640,10 @@ void main() {
       expect(controller.killSwitchBlocking.value, isFalse);
       expect(controller.killSwitchEngaging.value, isFalse);
       expect(controller.error.value, contains('could not be verified'));
+      // The unverified block tunnel must not stay up capturing all traffic.
+      expect(engine.current, VpnStage.disconnected);
+      expect(engine.blocking, isFalse);
+      expect(engine.stopPreserved.last, isFalse);
     },
   );
 

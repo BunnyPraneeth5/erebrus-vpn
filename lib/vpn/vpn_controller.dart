@@ -501,6 +501,10 @@ class VpnController extends GetxController {
       error.value = 'VPN provisioning is not configured';
       return;
     }
+    // Only a user who was already protected (switching nodes, or behind the
+    // kill switch) may be locked down when this attempt fails. A first
+    // connect that never came up must not leave the device blocked.
+    final wasProtected = isConnected || killSwitchBlocking.value;
     final generation = ++_generation;
     _preserveProxy = true;
     _userDisconnecting = false;
@@ -721,8 +725,8 @@ class VpnController extends GetxController {
                 );
                 return;
               }
-            } catch (_) {
-              debugPrint('[VPN] transport ${t.label} failed');
+            } catch (e) {
+              debugPrint('[VPN] transport ${t.label} failed: $e');
             }
             if (generation != _generation) return;
             _wasConnected = false;
@@ -748,6 +752,7 @@ class VpnController extends GetxController {
           stage.value = VpnStage.error;
         } on GatewayException catch (e) {
           if (generation != _generation) return;
+          debugPrint('[VPN] connect gateway error (attempt $attempt): $e');
           _wasConnected = false;
           if (_cancelRequested) {
             await _finishCancelled();
@@ -767,6 +772,7 @@ class VpnController extends GetxController {
           break;
         } catch (e) {
           if (generation != _generation) return;
+          debugPrint('[VPN] connect error: $e');
           _wasConnected = false;
           if (_cancelRequested) {
             await _finishCancelled();
@@ -779,7 +785,8 @@ class VpnController extends GetxController {
           break;
         }
       }
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[VPN] connect transition error: $e');
       if (generation == _generation) {
         stage.value = VpnStage.error;
         tunnelHealthy.value = false;
@@ -790,7 +797,22 @@ class VpnController extends GetxController {
       if (generation == _generation || _cancelRequested) {
         _connectInProgress = false;
       }
-      if (generation == _generation && _pendingDropGeneration == generation) {
+      if (generation == _generation && stage.value == VpnStage.error) {
+        debugPrint('[VPN] connect failed: ${error.value}');
+      }
+      if (generation == _generation &&
+          stage.value == VpnStage.error &&
+          !wasProtected) {
+        // Nothing was protected before this attempt: release the tunnel and
+        // any system proxy instead of falling back to the kill switch.
+        _pendingDropGeneration = null;
+        _preserveProxy = false;
+        await _engineOperation<void>(
+          generation,
+          () => _engine.stop(),
+        ).catchError((_) {});
+      } else if (generation == _generation &&
+          _pendingDropGeneration == generation) {
         await _drainUnexpectedDrop();
       } else if (generation == _generation &&
           stage.value == VpnStage.error &&
@@ -1083,7 +1105,16 @@ class VpnController extends GetxController {
       );
     } catch (_) {
       if (generation != _generation) return;
-      debugPrint('[VPN] kill switch engage failed');
+      debugPrint('[VPN] kill switch engage failed — tearing down block tunnel');
+      // An unverified block tunnel still captures all traffic (including the
+      // app's own gateway/login calls) while the UI reports it as not
+      // blocking. Never leave it half-up.
+      _preserveProxy = false;
+      await _engineOperation<void>(
+        generation,
+        () => _engine.stop(),
+      ).catchError((_) {});
+      await VpnSessionStore.clear().catchError((_) {});
       killSwitchBlocking.value = false;
       error.value =
           'Kill switch protection could not be verified — reconnect or disconnect to retry';
