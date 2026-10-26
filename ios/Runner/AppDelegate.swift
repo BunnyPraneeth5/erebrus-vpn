@@ -9,20 +9,11 @@ import UIKit
   let linkStreamHandler = LinkStreamHandler()
   private var eventsChannelRef: FlutterEventChannel?
   private var methodsChannelRef: FlutterMethodChannel?
-  var initialLink: String?
-
-  override func application(
-    _ application: UIApplication,
-    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
-  ) -> Bool {
-    if let url = launchOptions?[.url] as? URL {
-      initialLink = url.absoluteString
-    }
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
-  }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    engineBridge.pluginRegistry.registrar(forPlugin: "ErebrusDeepLinks")?
+      .addSceneDelegate(linkStreamHandler)
     SingboxBridge.shared.register(with: engineBridge.applicationRegistrar.messenger())
 
     let messenger = engineBridge.applicationRegistrar.messenger()
@@ -36,12 +27,8 @@ import UIKit
       name: AppDelegate.methodsChannel,
       binaryMessenger: messenger
     )
-    methodsChannelRef?.setMethodCallHandler { [weak self] call, result in
+    methodsChannelRef?.setMethodCallHandler { call, result in
       if call.method == "initialLink" {
-        if let link = self?.initialLink {
-          _ = self?.linkStreamHandler.handleLink(link)
-          self?.initialLink = nil
-        }
         result(nil)
       } else {
         result(FlutterMethodNotImplemented)
@@ -65,39 +52,88 @@ import UIKit
     continue userActivity: NSUserActivity,
     restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
   ) -> Bool {
-    if userActivity.activityType == NSUserActivityTypeBrowsingWeb,
-       let url = userActivity.webpageURL {
-      if !linkStreamHandler.handleLink(url.absoluteString) {
-        initialLink = url.absoluteString
-      }
+    if linkStreamHandler.handleUserActivity(userActivity) {
       return true
     }
     return super.application(application, continue: userActivity, restorationHandler: restorationHandler)
   }
 }
 
-class LinkStreamHandler: NSObject, FlutterStreamHandler {
-  var eventSink: FlutterEventSink?
-  var queuedLinks = [String]()
+final class LinkStreamHandler: NSObject, FlutterStreamHandler, FlutterSceneLifeCycleDelegate {
+  private var eventSink: FlutterEventSink?
+  private var queuedLinks = [String]()
+
+  static func ownsURL(_ url: URL) -> Bool {
+    if url.scheme?.lowercased() == "erebrusvpn" { return true }
+    return url.scheme?.lowercased() == "https" &&
+      url.host?.lowercased() == "erebrus.io" &&
+      (url.port == nil || url.port == 443) &&
+      url.user == nil && url.password == nil && url.path == "/vpn"
+  }
 
   func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
     self.eventSink = events
-    queuedLinks.forEach { events($0) }
+    let pending = queuedLinks
     queuedLinks.removeAll()
+    pending.forEach { events($0) }
     return nil
   }
 
   func onCancel(withArguments arguments: Any?) -> FlutterError? {
-    self.eventSink = nil
+    eventSink = nil
     return nil
   }
 
   func handleLink(_ link: String) -> Bool {
-    guard let eventSink = eventSink else {
+    guard let url = URL(string: link), Self.ownsURL(url) else { return false }
+    if let eventSink {
+      eventSink(link)
+    } else {
       queuedLinks.append(link)
-      return false
     }
-    eventSink(link)
     return true
+  }
+
+  func handleUserActivity(_ userActivity: NSUserActivity) -> Bool {
+    guard userActivity.activityType == NSUserActivityTypeBrowsingWeb,
+          let url = userActivity.webpageURL else { return false }
+    return handleLink(url.absoluteString)
+  }
+
+  func handleConnectionLinks(
+    urls: [URL],
+    userActivities: [NSUserActivity],
+    hasOtherPayload: Bool = false
+  ) -> Bool {
+    var links = urls.map { $0.absoluteString }
+    links += userActivities.compactMap {
+      $0.activityType == NSUserActivityTypeBrowsingWeb ? $0.webpageURL?.absoluteString : nil
+    }
+    var seen = Set<String>()
+    var handled = false
+    for link in links where seen.insert(link).inserted {
+      if handleLink(link) { handled = true }
+    }
+    return handled && !hasOtherPayload && urls.allSatisfy(Self.ownsURL) &&
+      userActivities.allSatisfy {
+        $0.activityType == NSUserActivityTypeBrowsingWeb &&
+          $0.webpageURL.map(Self.ownsURL) == true
+      }
+  }
+
+  func scene(
+    _ scene: UIScene,
+    willConnectTo session: UISceneSession,
+    options connectionOptions: UIScene.ConnectionOptions?
+  ) -> Bool {
+    guard let connectionOptions else { return false }
+    return handleConnectionLinks(
+      urls: connectionOptions.urlContexts.map { $0.url },
+      userActivities: Array(connectionOptions.userActivities),
+      hasOtherPayload: connectionOptions.shortcutItem != nil ||
+        connectionOptions.notificationResponse != nil ||
+        connectionOptions.cloudKitShareMetadata != nil ||
+        connectionOptions.handoffUserActivityType != nil
+    )
   }
 }

@@ -9,6 +9,7 @@ import 'auth/deep_link_handler.dart';
 import 'auth/runtime_config.dart';
 import 'auth/wallet_auth_controller.dart';
 import 'guest/guest_config_store.dart';
+import 'platform/desktop_browser.dart';
 import 'platform/desktop_shell.dart';
 import 'platform/platform_capabilities.dart';
 import 'settings/app_settings_controller.dart';
@@ -89,6 +90,7 @@ class ErebrusVpnApp extends StatelessWidget {
 
     final app = GetMaterialApp(
       title: 'Erebrus VPN',
+      navigatorObservers: [browserRouteObserver],
       debugShowCheckedModeBanner: false,
       theme: AppTheme.dark(),
       themeMode: ThemeMode.dark,

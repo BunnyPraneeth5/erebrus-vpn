@@ -20,10 +20,47 @@ import 'vpn_models.dart';
 /// include a TUN inbound can be started via an administrator prompt when needed.
 class SingboxDesktopRunner {
   SingboxDesktopRunner._();
+
+  @visibleForTesting
+  SingboxDesktopRunner.testing({
+    required Future<String?> Function() findBinary,
+    required Future<String> Function(String) writeConfig,
+    required Future<Process> Function(String, String) startProcess,
+    required Future<bool> Function() endpointReady,
+    required Future<void> Function() enableProxy,
+    required Future<void> Function() disableProxy,
+    required Future<bool> Function() proxyEnabled,
+  }) : _findBinaryOverride = findBinary,
+       _writeConfigOverride = writeConfig,
+       _startProcessOverride = startProcess,
+       _endpointReadyOverride = endpointReady,
+       _enableProxyOverride = enableProxy,
+       _disableProxyOverride = disableProxy,
+       _proxyEnabledOverride = proxyEnabled,
+       _testing = true;
+
   static final instance = SingboxDesktopRunner._();
+
+  Future<String?> Function()? _findBinaryOverride;
+  Future<String> Function(String)? _writeConfigOverride;
+  Future<Process> Function(String, String)? _startProcessOverride;
+  Future<bool> Function()? _endpointReadyOverride;
+  Future<void> Function()? _enableProxyOverride;
+  Future<void> Function()? _disableProxyOverride;
+  Future<bool> Function()? _proxyEnabledOverride;
+  bool _testing = false;
+  Future<void> _operations = Future<void>.value();
+  Future<void>? _exitCleanup;
+  final List<StreamSubscription<String>> _processLogs = [];
+  Process? _stoppingProcess;
+  int _generation = 0;
+  bool _routingReady = false;
+  bool _blockingConfig = false;
+  bool _failed = false;
 
   Process? _process;
   bool _privilegedMacos = false;
+  int? _privilegedPid;
   String? _workDir;
   String? _pidPath;
   String? _logPath;
@@ -41,7 +78,50 @@ class SingboxDesktopRunner {
   String get stage => _stage;
   String? get lastError => _lastError;
 
+  bool get hasRunningProcess => _process != null || _privilegedMacos;
+  bool get isBlocking =>
+      _blockingConfig && _routingReady && hasRunningProcess && !_failed;
+
+  Future<bool> verifyBlocking() async {
+    final generation = _generation;
+    if (!isBlocking || !_routingReady) return false;
+    try {
+      final proxy = await _proxyEnabled();
+      final ready = proxy && await _endpointReady();
+      return generation == _generation && isBlocking && _routingReady && ready;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<T> _serialize<T>(Future<T> Function() action) {
+    final result = _operations.then((_) => action());
+    _operations = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
+  Future<void> _enableProxy() =>
+      _enableProxyOverride?.call() ??
+      DesktopSystemProxy.enable(
+        host: SingboxConfigBuilder.localProxyHost,
+        port: SingboxConfigBuilder.localProxyPort,
+      );
+
+  Future<void> _disableProxy() =>
+      _disableProxyOverride?.call() ?? DesktopSystemProxy.disable();
+
+  Future<bool> _proxyEnabled() =>
+      _proxyEnabledOverride?.call() ??
+      DesktopSystemProxy.isEnabled(
+        host: SingboxConfigBuilder.localProxyHost,
+        port: SingboxConfigBuilder.localProxyPort,
+      );
+
   Future<String?> findBinary() async {
+    if (_findBinaryOverride != null) return _findBinaryOverride!();
     final exe = Platform.resolvedExecutable;
     final exeDir = p.dirname(exe);
     final name = Platform.isWindows ? 'sing-box.exe' : 'sing-box';
@@ -56,7 +136,7 @@ class SingboxDesktopRunner {
       p.join(cwd, 'bin', 'sing-box', 'darwin-arm64', name),
       p.join(cwd, 'bin', 'sing-box', 'darwin-amd64', name),
       p.join(cwd, 'bin', 'sing-box', 'linux-amd64', name),
-      p.join(cwd, 'bin', 'sing-box', 'windows-amd64', '$name.exe'),
+      p.join(cwd, 'bin', 'sing-box', 'windows-amd64', name),
       p.join(cwd, 'bin', name),
       p.join(cwd, 'native', name),
     ];
@@ -68,7 +148,9 @@ class SingboxDesktopRunner {
         return resolved;
       }
     }
-    debugPrint('[DesktopVPN] sing-box not found (searched ${candidates.length} paths)');
+    debugPrint(
+      '[DesktopVPN] sing-box not found (searched ${candidates.length} paths)',
+    );
     return null;
   }
 
@@ -76,59 +158,73 @@ class SingboxDesktopRunner {
     final binary = await findBinary();
     if (binary != null) return true;
     _lastError =
-        'sing-box binary missing — run ./scripts/setup-macos-dev.sh (or fetch-singbox-cli.sh macos)';
+        'sing-box binary missing — install the bundled CLI for ${PlatformCapabilities.platformLabel}';
     return false;
   }
 
-  Future<void> start(String configJson, {String profileName = 'Erebrus'}) async {
-    await stop();
-    final binary = await findBinary();
-    if (binary == null) {
-      _setStage('error');
-      _lastError =
-          'sing-box binary missing — run ./scripts/fetch-singbox-cli.sh ${PlatformCapabilities.platformLabel}';
-      throw StateError(_lastError!);
-    }
-
-    _workDir = await _ensureConfigDir();
-    final configPath = p.join(_workDir!, 'config.json');
-    final configFile = File(configPath);
-    await configFile.writeAsString(configJson);
-    await _restrictConfigPermissions(configPath);
-    _clashApiSecret = _extractClashApiSecret(configJson);
-    _statsPoller.secret = _clashApiSecret;
-    _logPath = p.join(_workDir!, 'singbox.log');
-    _pidPath = p.join(_workDir!, 'singbox.pid');
-
-    debugPrint('[DesktopVPN] starting $binary ($profileName, ${configJson.length} bytes)');
-    _setStage('connecting');
-    _lastError = null;
-    await DesktopSystemProxy.disable();
-
-    final wantsTun = _configUsesTun(configJson);
-    if (Platform.isMacOS && wantsTun) {
-      final elevated = await _startPrivilegedMacos(binary, configPath);
-      if (elevated) {
-        await _awaitReady(privileged: true);
-        return;
+  Future<void> start(
+    String configJson, {
+    String profileName = 'Erebrus',
+    bool preserveProxy = false,
+  }) => _serialize(() async {
+    try {
+      await _stop(preserveProxy: preserveProxy);
+      _generation++;
+      _failed = false;
+      _lastError = null;
+      _routingReady = false;
+      _blockingConfig = _configBlocks(configJson);
+      _setStage('connecting');
+      final binary = await findBinary();
+      if (binary == null) {
+        throw StateError(
+          'sing-box binary missing — install the bundled CLI for ${PlatformCapabilities.platformLabel}',
+        );
       }
-      debugPrint('[DesktopVPN] admin declined or TUN start failed — falling back to proxy mode');
-      final proxyConfig = _stripTunInbound(configJson);
-      await File(configPath).writeAsString(proxyConfig);
+      final String configPath;
+      if (_writeConfigOverride != null) {
+        configPath = await _writeConfigOverride!(configJson);
+        _workDir = p.dirname(configPath);
+      } else {
+        _workDir = await _ensureConfigDir();
+        configPath = p.join(_workDir!, 'config.json');
+        await File(configPath).writeAsString(configJson);
+        await _restrictConfigPermissions(configPath);
+      }
+      _clashApiSecret = _extractClashApiSecret(configJson);
+      _statsPoller.secret = _clashApiSecret;
+      _logPath = p.join(_workDir!, 'singbox.log');
+      _pidPath = p.join(_workDir!, 'singbox.pid');
+      debugPrint(
+        '[DesktopVPN] starting $binary ($profileName, ${configJson.length} bytes)',
+      );
+      if (!_testing && Platform.isMacOS && _configUsesTun(configJson)) {
+        if (await _startPrivilegedMacos(binary, configPath)) {
+          await _awaitReady(privileged: true);
+          return;
+        }
+        debugPrint(
+          '[DesktopVPN] admin declined or TUN start failed — falling back to proxy mode',
+        );
+        await File(configPath).writeAsString(_stripTunInbound(configJson));
+        _lastError = null;
+      }
       await _startSubprocess(binary, configPath);
       await _awaitReady(privileged: false);
-      return;
+    } catch (e) {
+      _lastError ??= e.toString();
+      _failed = true;
+      _routingReady = false;
+      _setStage('error');
+      try {
+        await _stop(preserveProxy: true);
+      } catch (cleanupError) {
+        _lastError = '$_lastError; cleanup failed: $cleanupError';
+      }
+      _setStage('error');
+      rethrow;
     }
-
-    if (Platform.isMacOS && !wantsTun) {
-      await _startSubprocess(binary, configPath);
-      await _awaitReady(privileged: false);
-      return;
-    }
-
-    await _startSubprocess(binary, configPath);
-    await _awaitReady(privileged: false);
-  }
+  });
 
   Future<bool> _startPrivilegedMacos(String binary, String configPath) async {
     final q = MacosPrivilegedProcess.shellQuote;
@@ -141,123 +237,164 @@ class SingboxDesktopRunner {
       return false;
     }
     _privilegedMacos = true;
+    _privilegedPid = int.tryParse(
+      (await File(_pidPath!).readAsString()).trim(),
+    );
+    if (_privilegedPid == null || _privilegedPid! <= 0) {
+      throw StateError('Could not identify privileged sing-box process');
+    }
     _process = null;
     _startLogTail();
     return true;
   }
 
   Future<void> _startSubprocess(String binary, String configPath) async {
-    try {
-      _process = await Process.start(
-        binary,
-        ['run', '-c', configPath, '--disable-color'],
-        mode: ProcessStartMode.normal,
-        workingDirectory: p.dirname(binary),
-      );
-    } catch (e) {
-      _lastError = e.toString();
-      _setStage('error');
-      rethrow;
-    }
-
-    var sawStarted = false;
+    final generation = _generation;
+    final process =
+        await (_startProcessOverride?.call(binary, configPath) ??
+            Process.start(
+              binary,
+              ['run', '-c', configPath, '--disable-color'],
+              mode: ProcessStartMode.normal,
+              workingDirectory: p.dirname(binary),
+            ));
+    _process = process;
+    bool current() => generation == _generation && identical(_process, process);
     void handleLine(String line) {
-      debugPrint('[sing-box] $line');
-      if (line.contains('sing-box started')) {
-        sawStarted = true;
-        _setStage('connected');
-        _startStats();
-      }
-      if (line.contains('FATAL') || line.contains('ERROR')) {
-        _lastError = line;
-      }
+      if (!current() || identical(_stoppingProcess, process)) return;
+      _handleLine(line);
     }
 
-    _process!.stdout
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .listen(handleLine);
-    _process!.stderr
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .listen(handleLine);
-
-    _process!.exitCode.then((code) async {
-      _stopStats();
-      await DesktopSystemProxy.disable();
-      if (_stage == 'disconnecting') {
-        _setStage('disconnected');
-      } else if (code != 0) {
-        _lastError ??= 'sing-box exited ($code)';
-        _setStage('error');
-      } else if (!sawStarted) {
-        _setStage('disconnected');
-      }
+    for (final stream in [process.stdout, process.stderr]) {
+      _processLogs.add(
+        stream
+            .transform(utf8.decoder)
+            .transform(const LineSplitter())
+            .listen(
+              handleLine,
+              onError: (Object error) {
+                if (current() && !identical(_stoppingProcess, process)) {
+                  _invalidate(error.toString());
+                }
+              },
+            ),
+      );
+    }
+    _exitCleanup = process.exitCode.then((code) async {
+      if (!current()) return;
+      final expected = identical(_stoppingProcess, process);
       _process = null;
+      _routingReady = false;
+      _stopStats();
+      if (expected) {
+        _setStage('disconnecting');
+      } else {
+        _invalidate('sing-box exited unexpectedly ($code)');
+      }
+      final logs = List<StreamSubscription<String>>.from(_processLogs);
+      _processLogs.clear();
+      for (final sub in logs) {
+        await sub.cancel();
+      }
     });
   }
 
-  Future<void> _awaitReady({required bool privileged}) async {
-    final ready = await _waitUntilReady(
-      hasFatal: () => _lastError != null && _lastError!.contains('FATAL'),
-      processAlive: () => privileged ? _privilegedMacos : _process != null,
-    );
-    if (!ready) {
-      _lastError ??= privileged
-          ? 'sing-box did not start after admin elevation'
-          : 'sing-box did not start — check logs for TUN/permission errors';
-      _setStage('error');
-      await stop();
-      throw StateError(_lastError!);
-    }
-    if (_stage != 'connected') {
-      _setStage('connected');
-      _startStats();
-    }
-    if (PlatformCapabilities.isDesktop) {
-      await DesktopSystemProxy.enable(
-        host: SingboxConfigBuilder.localProxyHost,
-        port: SingboxConfigBuilder.localProxyPort,
-      );
-      debugPrint(
-        '[DesktopVPN] system HTTP/SOCKS proxy → '
-        '${SingboxConfigBuilder.localProxyHost}:${SingboxConfigBuilder.localProxyPort}'
-        '${privileged ? ' (with TUN)' : ''}',
-      );
+  void _invalidate(String error) {
+    _lastError = error;
+    _failed = true;
+    _routingReady = false;
+    _stopStats();
+    _setStage('error');
+  }
+
+  void _handleLine(String line) {
+    debugPrint('[sing-box] $line');
+    if (line.contains('FATAL')) {
+      _invalidate(line);
+    } else if (line.contains('ERROR') && !_failed) {
+      _lastError = line;
     }
   }
 
-  Future<bool> _waitUntilReady({
-    required bool Function() hasFatal,
-    required bool Function() processAlive,
-  }) async {
+  Future<void> _awaitReady({required bool privileged}) async {
+    final generation = _generation;
+    var ready = false;
     for (var i = 0; i < 60; i++) {
-      if (hasFatal() || !processAlive()) return false;
-      if (_stage == 'connected' || await _clashApiReachable()) return true;
+      if (_failed || !hasRunningProcess) break;
+      if (await _endpointReady()) {
+        ready = true;
+        break;
+      }
       await Future<void>.delayed(const Duration(milliseconds: 250));
     }
-    return processAlive() && await _clashApiReachable();
+    if (!ready || _failed || !hasRunningProcess || generation != _generation) {
+      throw StateError(
+        _lastError ??
+            (privileged
+                ? 'sing-box did not start after admin elevation'
+                : 'sing-box did not start — check logs for TUN/permission errors'),
+      );
+    }
+    await _enableProxy();
+    final routing = await _proxyEnabled();
+    final endpoint = routing && await _endpointReady();
+    if (!endpoint ||
+        _failed ||
+        !hasRunningProcess ||
+        generation != _generation) {
+      throw StateError(_lastError ?? 'sing-box routing could not be verified');
+    }
+    _routingReady = true;
+    _setStage('connected');
+    _startStats();
   }
 
-  Future<bool> _clashApiReachable() async {
+  Future<bool> _endpointReady() async {
+    if (_endpointReadyOverride != null) return _endpointReadyOverride!();
+    if (_privilegedMacos && !await _privilegedProcessAlive()) return false;
     try {
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 1);
-      final req = await client.getUrl(Uri.parse('http://127.0.0.1:9090/'));
-      if (_clashApiSecret != null && _clashApiSecret!.isNotEmpty) {
-        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer ${_clashApiSecret!}');
-      }
-      final res = await req.close();
-      await res.drain();
-      client.close(force: true);
-      if (res.statusCode == 200 || res.statusCode == 404) {
-        if (_stage == 'connecting') {
-          _setStage('connected');
-          _startStats();
+      final socket = await Socket.connect(
+        SingboxConfigBuilder.localProxyHost,
+        SingboxConfigBuilder.localProxyPort,
+        timeout: const Duration(seconds: 1),
+      );
+      socket.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _privilegedProcessAlive() async {
+    final generation = _generation;
+    if (!_privilegedMacos) return false;
+    try {
+      final pid = _privilegedPid;
+      if (pid != null && pid > 0) {
+        final result = await Process.run('ps', ['-p', '$pid', '-o', 'stat=']);
+        final state = (result.stdout as String).trim();
+        if (generation != _generation || !_privilegedMacos) return false;
+        if (result.exitCode == 0 &&
+            state.isNotEmpty &&
+            !state.startsWith('Z')) {
+          return true;
         }
-        return true;
+        if (result.exitCode != 0 && result.exitCode != 1) {
+          throw StateError('ps failed: ${result.stderr}');
+        }
       }
-    } catch (_) {}
+    } catch (e) {
+      if (generation == _generation && _privilegedMacos) {
+        _invalidate('Could not verify privileged sing-box process: $e');
+      }
+      return false;
+    }
+    if (generation == _generation && _privilegedMacos) {
+      _privilegedMacos = false;
+      _logTailer?.cancel();
+      _logTailer = null;
+      _invalidate('sing-box privileged process exited unexpectedly');
+    }
     return false;
   }
 
@@ -266,64 +403,108 @@ class SingboxDesktopRunner {
     final logFile = _logPath;
     if (logFile == null) return;
     var offset = 0;
-    _logTailer = Stream.periodic(const Duration(milliseconds: 400)).listen((_) async {
+    final generation = _generation;
+    _logTailer = Stream.periodic(const Duration(milliseconds: 400)).listen((
+      _,
+    ) async {
       try {
+        if (generation != _generation || !await _privilegedProcessAlive()) {
+          return;
+        }
         final f = File(logFile);
         if (!await f.exists()) return;
         final len = await f.length();
         if (len <= offset) return;
-        final chunk = await f.openRead(offset, len).transform(utf8.decoder).join();
+        final chunk = await f
+            .openRead(offset, len)
+            .transform(utf8.decoder)
+            .join();
+        if (generation != _generation || !_privilegedMacos) return;
         offset = len;
         for (final line in chunk.split('\n')) {
-          if (line.isEmpty) continue;
-          debugPrint('[sing-box] $line');
-          if (line.contains('sing-box started')) {
-            _setStage('connected');
-            _startStats();
-          }
-          if (line.contains('FATAL') || line.contains('ERROR')) {
-            _lastError = line;
-          }
+          if (line.isNotEmpty) _handleLine(line);
         }
       } catch (_) {}
     });
   }
 
-  Future<void> stop() async {
-    await DesktopSystemProxy.disable();
-    _logTailer?.cancel();
-    _logTailer = null;
-
-    if (_privilegedMacos) {
-      _setStage('disconnecting');
-      _stopStats();
-      final q = MacosPrivilegedProcess.shellQuote;
-      final pidFile = _pidPath;
-      if (pidFile != null) {
-        await MacosPrivilegedProcess.runShellScript(
-          'if [ -f ${q(pidFile)} ]; then kill \$(cat ${q(pidFile)}) 2>/dev/null; rm -f ${q(pidFile)}; fi',
-        );
-      }
-      await MacosPrivilegedProcess.runShellScript('killall sing-box 2>/dev/null || true');
-      _privilegedMacos = false;
-      _setStage('disconnected');
-      return;
+  Future<void> stop({bool preserveProxy = false}) => _serialize(() async {
+    try {
+      await _stop(preserveProxy: preserveProxy);
+    } catch (e) {
+      _invalidate('sing-box stop failed: $e');
+      rethrow;
     }
+  });
 
-    if (_process == null) {
-      _setStage('disconnected');
-      return;
-    }
+  Future<void> _stop({required bool preserveProxy}) async {
+    _stoppingProcess = _process;
+    _routingReady = false;
     _setStage('disconnecting');
     _stopStats();
-    _process!.kill(ProcessSignal.sigterm);
-    try {
-      await _process!.exitCode.timeout(const Duration(seconds: 5));
-    } catch (_) {
-      _process!.kill(ProcessSignal.sigkill);
+    await _logTailer?.cancel();
+    _logTailer = null;
+    if (_privilegedMacos) {
+      final q = MacosPrivilegedProcess.shellQuote;
+      final pidFile = _pidPath;
+      final pid = _privilegedPid;
+      if (pid == null || pid <= 0 || pidFile == null) {
+        throw StateError(
+          'Cannot stop an unidentified privileged sing-box process',
+        );
+      }
+      _privilegedMacos = false;
+      final stopped = await MacosPrivilegedProcess.runShellScript(
+        'kill $pid 2>/dev/null; i=0; '
+        'while kill -0 $pid 2>/dev/null; do '
+        'i=\$((i + 1)); '
+        'if [ "\$i" -eq 50 ]; then kill -9 $pid 2>/dev/null; fi; '
+        'if [ "\$i" -ge 100 ]; then exit 1; fi; sleep 0.1; done; '
+        'rm -f ${q(pidFile)}',
+      );
+      if (!stopped) {
+        _privilegedMacos = true;
+        throw StateError('Could not stop privileged sing-box process');
+      }
+      _privilegedPid = null;
     }
-    _process = null;
+    final process = _process;
+    final cleanup = _exitCleanup;
+    if (process != null) {
+      _stoppingProcess = process;
+      process.kill(ProcessSignal.sigterm);
+      try {
+        await cleanup?.timeout(const Duration(seconds: 5));
+      } on TimeoutException {
+        process.kill(ProcessSignal.sigkill);
+        await cleanup?.timeout(const Duration(seconds: 5));
+      }
+    } else {
+      await cleanup;
+    }
+    _exitCleanup = null;
+    _stoppingProcess = null;
+    _generation++;
+    if (!preserveProxy) await _disableProxy();
     _setStage('disconnected');
+  }
+
+  bool _configBlocks(String configJson) {
+    try {
+      final config = jsonDecode(configJson) as Map<String, dynamic>;
+      final route = config['route'] as Map?;
+      final finalTag = route?['final'];
+      final rules = route?['rules'] as List? ?? const [];
+      if (rules.isNotEmpty) return false;
+      if (finalTag is! String || finalTag.isEmpty) return false;
+      final outbounds = config['outbounds'] as List? ?? const [];
+      final targets = outbounds
+          .where((outbound) => outbound is Map && outbound['tag'] == finalTag)
+          .toList();
+      return targets.length == 1 && (targets.single as Map)['type'] == 'block';
+    } catch (_) {
+      return false;
+    }
   }
 
   String? _extractClashApiSecret(String configJson) {
@@ -349,9 +530,15 @@ class SingboxDesktopRunner {
     try {
       if (Platform.isWindows) {
         // Remove inherited ACEs and allow only the current user.
-        final user = Platform.environment['USER'] ?? Platform.environment['USERNAME'];
+        final user =
+            Platform.environment['USER'] ?? Platform.environment['USERNAME'];
         if (user != null && user.isNotEmpty) {
-          await Process.run('icacls', [configPath, '/inheritance:r', '/grant:r', '$user:(R,W)']);
+          await Process.run('icacls', [
+            configPath,
+            '/inheritance:r',
+            '/grant:r',
+            '$user:(R,W)',
+          ]);
         }
       } else if (Platform.isMacOS || Platform.isLinux) {
         await Process.run('chmod', ['600', configPath]);
@@ -395,6 +582,7 @@ class SingboxDesktopRunner {
   }
 
   void _startStats() {
+    if (_testing) return;
     _stopStats();
     unawaited(_statsPoller.start());
   }

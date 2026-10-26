@@ -73,7 +73,10 @@ final class SingboxBridge {
           self.complete(result, with: updated)
         }
       case "lastError":
-        result(nil)
+        Task {
+          let error = await TunnelManager.shared.lastError
+          self.complete(result, with: error)
+        }
       default:
         result(FlutterMethodNotImplemented)
       }

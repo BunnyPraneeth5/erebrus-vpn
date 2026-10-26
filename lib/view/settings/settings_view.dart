@@ -244,7 +244,10 @@ class _SettingsViewState extends State<SettingsView> {
                 _GroupRow(
                   icon: Icons.lock_outline,
                   title: 'Kill switch',
-                  subtitle: 'Block internet if the VPN drops unexpectedly',
+                  subtitleMaxLines: null,
+                  subtitle: PlatformCapabilities.usesDesktopVpnRunner
+                      ? 'Block proxy traffic if the VPN drops unexpectedly. Only traffic using the system proxy is covered; apps that bypass it are not blocked.'
+                      : 'Block tunnel traffic if the VPN drops unexpectedly',
                   trailing: Obx(
                     () => EreToggle(
                       value: settings.killSwitchEnabled.value,
@@ -1072,12 +1075,14 @@ class _GroupRow extends StatelessWidget {
     this.icon,
     required this.title,
     this.subtitle,
+    this.subtitleMaxLines = 2,
     this.trailing,
     this.onTap,
   });
   final IconData? icon;
   final String title;
   final String? subtitle;
+  final int? subtitleMaxLines;
   final Widget? trailing;
   final VoidCallback? onTap;
 
@@ -1112,7 +1117,7 @@ class _GroupRow extends StatelessWidget {
                     const SizedBox(height: 2),
                     Text(
                       subtitle!,
-                      maxLines: 2,
+                      maxLines: subtitleMaxLines,
                       overflow: TextOverflow.ellipsis,
                       style: grotesk(
                         size: 11.5,

@@ -196,6 +196,7 @@ class GatewayClient {
           response.error.message,
           statusCode: response.status,
           code: response.code,
+          details: GatewayHttp.errorDetails(response.body),
           retryAt: response.retryAt,
         );
       }
@@ -216,11 +217,20 @@ class GatewayClient {
 }
 
 class GatewayException implements Exception {
-  GatewayException(this.message, {this.statusCode, this.code, this.retryAt});
+  GatewayException(
+    this.message, {
+    this.statusCode,
+    this.code,
+    this.details,
+    this.retryAt,
+  });
   final String message;
   final int? statusCode;
   final String? code;
   final DateTime? retryAt;
+
+  /// Optional structured details from the gateway (e.g. device limit counts).
+  final Map<String, dynamic>? details;
 
   bool get isSessionExpired => const {
     'REFRESH_TOKEN_INVALID',
@@ -231,8 +241,13 @@ class GatewayException implements Exception {
   /// A quota rejection is authoritative; cached configs must not bypass it.
   bool get isDeviceLimitReached => code == 'DEVICE_LIMIT_REACHED';
 
+  /// Plan-limit rejections (device limit, or a device paused because the plan
+  /// no longer covers it). Also authoritative over cached configs.
+  bool get isPlanLimitRejected =>
+      code == 'VPN_DEVICE_LIMIT' || code == 'VPN_DEVICE_PAUSED';
+
   bool get blocksProvisioningFallback =>
-      blocksAuthenticatedRequest || isDeviceLimitReached;
+      blocksAuthenticatedRequest || isDeviceLimitReached || isPlanLimitRejected;
 
   bool get blocksAuthenticatedRequest =>
       isSessionExpired ||
@@ -259,6 +274,9 @@ class VpnClientRow {
   final String nodeId;
   final String wgPublicKey;
   final String status;
+
+  /// Paused by the gateway because the plan no longer covers this device.
+  bool get isPlanPaused => status == 'suspended_plan_limit';
 
   factory VpnClientRow.fromJson(Map<String, dynamic> j) => VpnClientRow(
     id: (j['id'] ?? '').toString(),

@@ -27,15 +27,18 @@ package_macos() {
 }
 
 package_linux() {
-  local bundle
-  bundle="$(find build/linux -maxdepth 2 -type d -name 'bundle' | head -1)"
-  if [[ -z "${bundle}" ]]; then
+  local bundle="${ROOT_DIR}/build/linux/x64/release/bundle"
+  if [[ ! -d "${bundle}" ]]; then
     echo "✗ linux bundle not found"
     exit 1
   fi
   local tag="${1:-local}"
   mkdir -p dist
   local out="dist/erebrus-vpn-linux-${tag}.tar.gz"
+  [[ -x "${bundle}/sing-box" ]] || {
+    echo "CMake did not package sing-box in ${bundle}; rebuild the Linux x64 release." >&2
+    exit 1
+  }
   tar -czf "${out}" -C "$(dirname "${bundle}")" "$(basename "${bundle}")"
   echo "✓ packaged → ${out}"
 }
@@ -50,8 +53,36 @@ package_windows() {
   mkdir -p dist
   # Absolute path — zip resolves relative paths against the cd'd runner dir.
   local out="${ROOT_DIR}/dist/erebrus-vpn-windows-${tag}.zip"
-  (cd "${runner_dir}" && zip -qr "${out}" .)
+  [[ -f "${runner_dir}/sing-box.exe" ]] || {
+    echo "CMake did not package sing-box.exe in ${runner_dir}; rebuild the Windows x64 release." >&2
+    exit 1
+  }
+  rm -f "${out}"
+  # Git Bash on Windows runners ships without `zip`; fall back to 7-Zip, then
+  # PowerShell's Compress-Archive.
+  if command -v zip >/dev/null 2>&1; then
+    (cd "${runner_dir}" && zip -qr "${out}" .)
+  elif command -v 7z >/dev/null 2>&1; then
+    (cd "${runner_dir}" && 7z a -tzip -bd "${out}" . >/dev/null)
+  else
+    powershell.exe -NoProfile -Command \
+      "Compress-Archive -Path '$(cygpath -w "${runner_dir}")\\*' -DestinationPath '$(cygpath -w "${out}")' -Force"
+  fi
   echo "✓ packaged → dist/erebrus-vpn-windows-${tag}.zip"
+}
+
+# First interpreter that actually runs: on Windows `python3` is often the
+# Microsoft Store stub, which exists on PATH but cannot execute scripts.
+python_cmd() {
+  local c
+  for c in ${PYTHON:-} python3 python; do
+    if command -v "${c}" >/dev/null 2>&1 && "${c}" -c 'import sys' >/dev/null 2>&1; then
+      echo "${c}"
+      return
+    fi
+  done
+  echo "✗ Python 3 not found — install it (with Pillow) or set PYTHON" >&2
+  return 1
 }
 
 read_version_tag() {
@@ -61,36 +92,11 @@ read_version_tag() {
   echo "v${version_name}"
 }
 
-embed_singbox_linux() {
-  local bundle
-  bundle="$(find build/linux -maxdepth 2 -type d -name 'bundle' | head -1)"
-  if [[ -z "${bundle}" ]]; then
-    echo "✗ linux bundle not found"
-    exit 1
-  fi
-  local src="${ROOT_DIR}/bin/sing-box/linux-amd64/sing-box"
-  [[ -f "${src}" ]] || "${SCRIPT_DIR}/fetch-singbox-cli.sh" linux
-  install -m 755 "${src}" "${bundle}/sing-box"
-  echo "✓ embedded sing-box → ${bundle}/sing-box"
-}
-
-embed_singbox_windows() {
-  local runner_dir="${ROOT_DIR}/build/windows/x64/runner/Release"
-  if [[ ! -d "${runner_dir}" ]]; then
-    echo "✗ windows Release folder not found"
-    exit 1
-  fi
-  local src="${ROOT_DIR}/bin/sing-box/windows-amd64/sing-box.exe"
-  [[ -f "${src}" ]] || "${SCRIPT_DIR}/fetch-singbox-cli.sh" windows
-  install -m 755 "${src}" "${runner_dir}/sing-box.exe"
-  echo "✓ embedded sing-box → ${runner_dir}/sing-box.exe"
-}
-
 dart_define_args() {
   if [[ -f "${ROOT_DIR}/.env" ]]; then
     echo "--dart-define-from-file=${ROOT_DIR}/.env"
   else
-    echo "⚠ .env missing — cp env.example .env and set REOWN_PROJECT_ID" >&2
+    echo "⚠ .env missing — cp .env.example .env and set REOWN_PROJECT_ID" >&2
   fi
 }
 
@@ -105,17 +111,16 @@ build_one() {
     "${SCRIPT_DIR}/build-libbox-macos.sh"
     ruby "${SCRIPT_DIR}/setup-macos-tunnel.rb"
   fi
+  case "${p}" in
+    linux|windows) "${SCRIPT_DIR}/fetch-singbox-cli.sh" "${p}" ;;
+  esac
   echo "▸ flutter pub get"
   flutter pub get
   echo "▸ generate desktop brand assets"
-  python3 scripts/generate-desktop-assets.py
+  "$(python_cmd)" scripts/generate-desktop-assets.py
   echo "▸ flutter build ${p} --release ${define_args}"
   # shellcheck disable=SC2086
   flutter build "${p}" --release ${define_args}
-  case "${p}" in
-    linux) embed_singbox_linux ;;
-    windows) embed_singbox_windows ;;
-  esac
   case "${p}" in
     macos) package_macos "${tag}" ;;
     linux) package_linux "${tag}" ;;

@@ -639,7 +639,7 @@ class SingboxConfigBuilder {
         remoteServer: dnsServer,
         wgTag: wgEndpointTag,
         tunInbound: useSystemTunnel,
-        bootstrapDomains: host != peerHost ? [host] : const [],
+        bootstrapDomains: [if (host.isNotEmpty && !_isIpLiteral(host)) host],
       ),
       'inbounds': _inbounds(includeTun: useSystemTunnel),
       'outbounds': [

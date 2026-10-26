@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:sign_in_with_apple/sign_in_with_apple.dart';
 
@@ -16,7 +17,8 @@ import 'runtime_config.dart';
 /// id while the returned token targets the configured gateway/server client.
 bool get googleSignInSupported =>
     RuntimeConfig.googleServerClientId.isNotEmpty &&
-    (Platform.isAndroid || (Platform.isIOS && kGoogleIosClientId.isNotEmpty));
+    ((Platform.isAndroid && RuntimeConfig.googleLoginEnabled) ||
+        (Platform.isIOS && kGoogleIosClientId.isNotEmpty));
 
 /// Whether Apple sign-in can run: native on iOS/macOS, or a configured Services
 /// id elsewhere.
@@ -28,7 +30,7 @@ Future<bool> appleSignInSupported() async {
       return false;
     }
   }
-  return kAppleServiceId.isNotEmpty;
+  return (kIsWeb || Platform.isAndroid) && kAppleServiceId.isNotEmpty;
 }
 
 /// Runs the Google sign-in sheet and returns an id_token, or null if cancelled.
@@ -38,7 +40,13 @@ Future<String?> googleIdToken() async {
     serverClientId: RuntimeConfig.googleServerClientId,
     scopes: const ['email'],
   );
-  final account = await google.signIn();
+  final GoogleSignInAccount? account;
+  try {
+    account = await google.signIn();
+  } on PlatformException catch (e) {
+    if (e.code == 'sign_in_canceled') return null;
+    throw SocialLoginException(googleSignInErrorMessage(e));
+  }
   if (account == null) return null; // user dismissed the chooser
   final auth = await account.authentication;
   final token = auth.idToken;
@@ -48,8 +56,34 @@ Future<String?> googleIdToken() async {
   return token;
 }
 
+/// Maps Google Play services `ApiException` status codes to readable text.
+/// Code 10 (DEVELOPER_ERROR) means this build's signing-certificate SHA-1 is
+/// not registered for the app's Android OAuth client in Google Cloud.
+@visibleForTesting
+String googleSignInErrorMessage(PlatformException e) {
+  final detail = '${e.code} ${e.message ?? ''}';
+  final status = RegExp(r'ApiException:\s*(\d+)').firstMatch(detail)?.group(1);
+  debugPrint('[Auth] google sign-in failed: $detail');
+  return switch (status) {
+    '10' =>
+      'Google sign-in isn\'t set up for this build yet. '
+          'Please sign in with email for now.',
+    '7' => 'Google sign-in needs an internet connection. Check it and retry.',
+    '12500' =>
+      'Google sign-in failed on this device. Update Google Play services '
+          'and try again.',
+    _ => 'Google sign-in failed${status == null ? '' : ' (code $status)'}. '
+        'Please try again or use email.',
+  };
+}
+
 /// Runs Apple sign-in and returns every value the gateway validates.
 Future<AppleLoginCredential?> appleCredential() async {
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
+    throw const SocialLoginException(
+      'Apple sign-in is not supported on this platform',
+    );
+  }
   final useWebRelay = !(Platform.isIOS || Platform.isMacOS);
   final nonce = generateNonce();
   final state = 'vpn.${generateNonce()}';
@@ -114,6 +148,7 @@ class AppleLoginCredential {
 
 /// Best-effort sign-out from the Google session (so the chooser shows next time).
 Future<void> googleSignOut() async {
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) return;
   try {
     await GoogleSignIn().signOut();
   } catch (e) {

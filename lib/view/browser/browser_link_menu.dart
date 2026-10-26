@@ -137,14 +137,18 @@ BrowserLinkHit? parseBrowserLinkHit(String message) {
   }
 }
 
-void showBrowserLinkContextMenu(
+Future<void> showBrowserLinkContextMenu(
   BuildContext context,
   BrowserController controller,
   BrowserLinkHit hit,
-) {
+) async {
+  if (!BrowserController.isWebUrl(hit.url)) return;
   final label = hit.label.isNotEmpty ? hit.label : hit.url;
+  controller.setRouteCovered(true);
+  ModalRoute<dynamic>? menuRoute;
 
-  showModalBottomSheet<void>(
+  try {
+    await showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     backgroundColor: AppColors.raised,
@@ -152,6 +156,7 @@ void showBrowserLinkContextMenu(
       borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.sheet)),
     ),
     builder: (ctx) {
+      menuRoute = ModalRoute.of(ctx);
       final maxHeight = MediaQuery.sizeOf(ctx).height * 0.82;
 
       return SafeArea(
@@ -246,7 +251,24 @@ void showBrowserLinkContextMenu(
                     Navigator.pop(ctx);
                     final uri = Uri.tryParse(hit.url);
                     if (uri == null) return;
-                    await launchUrl(uri, mode: LaunchMode.externalApplication);
+                    var launched = false;
+                    try {
+                      launched = await launchUrl(
+                        uri,
+                        mode: LaunchMode.externalApplication,
+                      );
+                    } catch (_) {
+                      launched = false;
+                    }
+                    if (!launched && context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Could not open the external browser'),
+                          behavior: SnackBarBehavior.floating,
+                          backgroundColor: AppColors.surface3,
+                        ),
+                      );
+                    }
                   },
                 ),
                 const SizedBox(height: 8),
@@ -256,7 +278,13 @@ void showBrowserLinkContextMenu(
         ),
       );
     },
-  );
+    );
+  } finally {
+    await menuRoute?.completed;
+    if (context.mounted) {
+      controller.setRouteCovered(ModalRoute.of(context)?.isCurrent == false);
+    }
+  }
 }
 
 class _LinkMenuTile extends StatelessWidget {

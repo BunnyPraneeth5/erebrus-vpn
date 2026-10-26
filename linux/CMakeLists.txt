@@ -54,8 +54,16 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
 
+option(EREBRUS_BUILD_NATIVE_TESTS "Build side-effect-free Linux runner tests" OFF)
+if(EREBRUS_BUILD_NATIVE_TESTS)
+  enable_testing()
+endif()
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/../scripts/singbox-runtime.cmake")
+erebrus_bundle_singbox(${BINARY_NAME} linux-amd64)
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
@@ -88,10 +96,18 @@ install(CODE "
   file(REMOVE_RECURSE \"${BUILD_BUNDLE_DIR}/\")
   " COMPONENT Runtime)
 
-set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
-set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}/lib")
+set(INSTALL_BUNDLE_DATA_DIR "data")
+set(INSTALL_BUNDLE_LIB_DIR "lib")
 
-install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "."
+  COMPONENT Runtime)
+install(PROGRAMS "${EREBRUS_SINGBOX_BINARY}" DESTINATION "."
+  COMPONENT Runtime)
+
+configure_file("runner/erebrus-vpn.desktop.in"
+  "${PROJECT_BINARY_DIR}/${APPLICATION_ID}.desktop" @ONLY)
+install(FILES "${PROJECT_BINARY_DIR}/${APPLICATION_ID}.desktop"
+  DESTINATION "share/applications"
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
@@ -120,7 +136,7 @@ install(DIRECTORY "${NATIVE_ASSETS_DIR}"
 # from a previous install.
 set(FLUTTER_ASSET_DIR_NAME "flutter_assets")
 install(CODE "
-  file(REMOVE_RECURSE \"${INSTALL_BUNDLE_DATA_DIR}/${FLUTTER_ASSET_DIR_NAME}\")
+  file(REMOVE_RECURSE \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${INSTALL_BUNDLE_DATA_DIR}/${FLUTTER_ASSET_DIR_NAME}\")
   " COMPONENT Runtime)
 install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
   DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" COMPONENT Runtime)

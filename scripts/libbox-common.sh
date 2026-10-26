@@ -36,5 +36,6 @@ prepare_singbox_source() {
   fi
   go get "golang.org/x/mobile/cmd/gomobile@${GOMOBILE_VERSION}" \
          "golang.org/x/mobile/cmd/gobind@${GOMOBILE_VERSION}"
-  gomobile init
+  # No `gomobile init`: it only builds OpenAL (unused here) and runs
+  # `go install gobind@latest`, which replaces the pinned gobind above.
 }

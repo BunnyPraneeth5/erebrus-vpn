@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../../platform/desktop_browser.dart';
 import '../../platform/platform_capabilities.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/premium_widgets.dart';
@@ -23,19 +26,59 @@ class BrowserView extends StatefulWidget {
   State<BrowserView> createState() => _BrowserViewState();
 }
 
-class _BrowserViewState extends State<BrowserView> {
-  BrowserController get _c => Get.isRegistered<BrowserController>()
-      ? Get.find<BrowserController>()
-      : Get.put(BrowserController());
+class _BrowserViewState extends State<BrowserView> with RouteAware {
+  late final BrowserController _c;
+  ModalRoute<dynamic>? _route;
+  int _routeGeneration = 0;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (_route == route) return;
+    browserRouteObserver.unsubscribe(this);
+    _route = route;
+    if (route != null) browserRouteObserver.subscribe(this, route);
+    _c.setRouteCovered(route != null && !route.isCurrent);
+  }
+
+  @override
+  void didPushNext() {
+    _routeGeneration++;
+    _c.setRouteCovered(true);
+  }
+
+  @override
+  void didPopNext() {
+    final generation = ++_routeGeneration;
+    final departing = browserRouteObserver.departingRoute;
+    if (!PlatformCapabilities.usesDesktopVpnRunner || departing == null) {
+      _c.setRouteCovered(false);
+      return;
+    }
+    unawaited(
+      departing.then((_) {
+        if (mounted &&
+            generation == _routeGeneration &&
+            _route?.isCurrent == true) {
+          _c.setRouteCovered(false);
+        }
+      }),
+    );
+  }
 
   @override
   void initState() {
     super.initState();
+    _c = Get.isRegistered<BrowserController>()
+        ? Get.find<BrowserController>()
+        : Get.put(BrowserController());
     _c.linkContextMenuHandler = _onLinkContextMenu;
   }
 
   @override
   void dispose() {
+    browserRouteObserver.unsubscribe(this);
     _c.linkContextMenuHandler = null;
     _c.setShellTabVisible(false);
     super.dispose();
@@ -49,6 +92,41 @@ class _BrowserViewState extends State<BrowserView> {
 
   @override
   Widget build(BuildContext context) {
+    if (!PlatformCapabilities.supportsEmbeddedBrowser) {
+      return Scaffold(
+        backgroundColor: AppColors.bg,
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.web_asset_off,
+                    size: 40,
+                    color: AppColors.textSecondary,
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'Embedded browser unavailable',
+                    textAlign: TextAlign.center,
+                    style: grotesk(size: 20, weight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'In-app browsing is not supported on this platform. '
+                    'VPN controls remain available.',
+                    textAlign: TextAlign.center,
+                    style: grotesk(size: 14, color: AppColors.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
     final c = _c;
 
     return Scaffold(
@@ -76,17 +154,70 @@ class _BrowserViewState extends State<BrowserView> {
                 if (c.tabs.isEmpty) return const SizedBox.shrink();
                 final tab = c.activeTab;
                 if (tab.isStart) return const _StartPage();
-                if (!c.shellTabVisible.value) {
+                if (PlatformCapabilities.usesDesktopVpnRunner &&
+                    !c.protectionAvailable.value) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text(
+                        'Connect VPN to browse securely',
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  );
+                }
+                final error = c.browserError.value;
+                if (error != null) {
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(error, textAlign: TextAlign.center),
+                          const SizedBox(height: 12),
+                          TextButton(
+                            onPressed: c.reload,
+                            child: const Text('Retry'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }
+                if (!c.canMountBrowser || !tab.configured) {
                   // Shell is on VPN/Settings — keep Flutter-only UI in the tree.
                   return _PendingWebPage(
                     url: tab.url,
                     loading: c.isLoading.value,
                   );
                 }
+                if (PlatformCapabilities.usesDesktopVpnRunner) {
+                  return Column(
+                    children: [
+                      SizedBox(
+                        height: 2,
+                        child: c.isLoading.value
+                            ? const LinearProgressIndicator(
+                                backgroundColor: Colors.transparent,
+                                color: AppColors.accent,
+                              )
+                            : null,
+                      ),
+                      Expanded(
+                        child: _DesktopWebPage(
+                          key: ValueKey('${tab.id}:${tab.generation}'),
+                          browser: c,
+                          tab: tab,
+                        ),
+                      ),
+                    ],
+                  );
+                }
                 return Stack(
                   children: [
                     WebViewWidget(
-                      key: ValueKey(tab.id),
+                      key: ValueKey('${tab.id}:${tab.generation}'),
                       controller: tab.controller,
                     ),
                     if (c.isLoading.value)
@@ -99,7 +230,7 @@ class _BrowserViewState extends State<BrowserView> {
                 );
               }),
             ),
-            if (!PlatformCapabilities.isDesktop) _ControlBar(controller: c),
+            _ControlBar(controller: c),
           ],
         ),
       ),
@@ -142,6 +273,39 @@ class _PendingWebPage extends StatelessWidget {
       ),
     );
   }
+}
+
+class _DesktopWebPage extends StatefulWidget {
+  const _DesktopWebPage({super.key, required this.browser, required this.tab});
+
+  final BrowserController browser;
+  final BrowserTab tab;
+
+  @override
+  State<_DesktopWebPage> createState() => _DesktopWebPageState();
+}
+
+class _DesktopWebPageState extends State<_DesktopWebPage> {
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_showWhenLaidOut());
+  }
+
+  @override
+  void activate() {
+    super.activate();
+    unawaited(_showWhenLaidOut());
+  }
+
+  Future<void> _showWhenLaidOut() async {
+    await WidgetsBinding.instance.endOfFrame;
+    if (mounted) await widget.browser.showNativeTab(widget.tab);
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      WebViewWidget(controller: widget.tab.controller);
 }
 
 class _TabStrip extends StatelessWidget {

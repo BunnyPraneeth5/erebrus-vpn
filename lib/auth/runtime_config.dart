@@ -25,6 +25,17 @@ class RuntimeConfig {
 
   static String get gatewayUrl => _values['GATEWAY_URL'] ?? '';
 
+  /// Shows "Continue with Google" on Android only when explicitly enabled
+  /// (`GOOGLE_LOGIN_ENABLED=true` via dart-define or `.env`). Android Google
+  /// Sign-In fails with ApiException 10 until the signing key's SHA-1 is
+  /// registered for com.erebrus.vpn in Google Cloud, so it defaults to off.
+  static bool get googleLoginEnabled =>
+      _firstNonEmpty([
+        kGoogleLoginEnabledDefine,
+        _values['GOOGLE_LOGIN_ENABLED'],
+      ]).toLowerCase() ==
+      'true';
+
   /// Erebrus webapp origin for desktop browser sign-in (`.env` may use localhost).
   static String get erebrusWebOrigin =>
       _firstNonEmpty([_values['EREBRUS_WEB_ORIGIN'], kErebrusWebOrigin]);

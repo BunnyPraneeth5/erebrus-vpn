@@ -2,6 +2,8 @@
 
 #include <optional>
 
+#include "browser_proxy_plugin.h"
+#include "deep_link_plugin.h"
 #include "flutter/generated_plugin_registrant.h"
 #include "singbox_plugin.h"
 
@@ -25,8 +27,10 @@ bool FlutterWindow::OnCreate() {
   if (!flutter_controller_->engine() || !flutter_controller_->view()) {
     return false;
   }
+  RegisterBrowserProxyPlugin(flutter_controller_.get());
   RegisterPlugins(flutter_controller_->engine());
   RegisterSingboxPlugin(flutter_controller_.get());
+  RegisterDeepLinkPlugin(flutter_controller_.get());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {

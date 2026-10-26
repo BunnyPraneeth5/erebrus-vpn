@@ -37,8 +37,9 @@ class ConnectView extends StatefulWidget {
 
 class _ConnectViewState extends State<ConnectView> {
   VpnController get _c => Get.find<VpnController>();
-  WalletAuthController? get _auth =>
-      Get.isRegistered<WalletAuthController>() ? Get.find<WalletAuthController>() : null;
+  WalletAuthController? get _auth => Get.isRegistered<WalletAuthController>()
+      ? Get.find<WalletAuthController>()
+      : null;
 
   Timer? _ticker;
   final _elapsed = Duration.zero.obs;
@@ -69,8 +70,9 @@ class _ConnectViewState extends State<ConnectView> {
     // Base the elapsed time on the controller's connect timestamp so it stays
     // accurate even if this view is rebuilt mid-session.
     final since = _c.connectedSince.value;
-    _elapsed.value =
-        since == null ? Duration.zero : DateTime.now().difference(since);
+    _elapsed.value = since == null
+        ? Duration.zero
+        : DateTime.now().difference(since);
   }
 
   void _stopTimer() {
@@ -103,8 +105,8 @@ class _ConnectViewState extends State<ConnectView> {
       _c.error.value = node?.isPrivateAccess == true && ent.orgMember == false
           ? 'Accept your workspace invite to connect to private org nodes'
           : ent.trialConsumed
-              ? 'Trial ended — renew on erebrus.io with the same wallet'
-              : 'Start your free trial in Settings to connect';
+          ? 'Trial ended — renew on erebrus.io with the same wallet'
+          : 'Start your free trial in Settings to connect';
       widget.onGoSettings?.call();
       return;
     }
@@ -146,7 +148,7 @@ class _ConnectViewState extends State<ConnectView> {
   String _protocolBlurb(VpnController c) {
     final stage = c.stage.value;
     final transport = c.activeTransport.value;
-    if (stage == VpnStage.connected && transport != null) {
+    if (c.isProtected && transport != null) {
       return 'In use · ${transport.label}';
     }
     if (stage == VpnStage.connecting && transport != null) {
@@ -167,29 +169,38 @@ class _ConnectViewState extends State<ConnectView> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               // header
-              Obx(() => _StatusHeader(
-                    stage: _c.stage.value,
-                    blocking: _c.killSwitchBlocking.value,
-                    healthy: _c.tunnelHealthy.value,
-                    onDiagnostics: widget.onOpenDiagnostics,
-                  )),
+              Obx(
+                () => _StatusHeader(
+                  status: vpnSafetyStatus(_c),
+                  onDiagnostics: widget.onOpenDiagnostics,
+                ),
+              ),
               const SizedBox(height: 16),
               // protocol segmented
-              Obx(() => _ProtocolSegment(
-                    mode: _displayMode(_c),
-                    enabled: !_c.isConnected &&
-                        !_c.isBusy &&
-                        !_c.killSwitchBlocking.value,
-                    onSelect: _setProtocol,
-                  )),
+              Obx(
+                () => _ProtocolSegment(
+                  mode: _displayMode(_c),
+                  enabled:
+                      !_c.isConnected &&
+                      !_c.isBusy &&
+                      !_c.killSwitchBlocking.value,
+                  onSelect: _setProtocol,
+                ),
+              ),
               const SizedBox(height: 8),
-              Obx(() => Center(
-                    child: Text(
-                      _protocolBlurb(_c),
-                      textAlign: TextAlign.center,
-                      style: mono(size: 11, weight: FontWeight.w400, color: AppColors.textMuted),
+              Obx(
+                () => Center(
+                  child: Text(
+                    _protocolBlurb(_c),
+                    textAlign: TextAlign.center,
+                    style: mono(
+                      size: 11,
+                      weight: FontWeight.w400,
+                      color: AppColors.textMuted,
                     ),
-                  )),
+                  ),
+                ),
+              ),
               // dial
               Expanded(
                 child: LayoutBuilder(
@@ -197,62 +208,88 @@ class _ConnectViewState extends State<ConnectView> {
                     return SingleChildScrollView(
                       physics: const ClampingScrollPhysics(),
                       child: ConstrainedBox(
-                        constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                        constraints: BoxConstraints(
+                          minHeight: constraints.maxHeight,
+                        ),
                         child: Center(
                           child: Obx(() {
                             final stage = _c.stage.value;
-                            final blocking = _c.killSwitchBlocking.value;
+                            final status = vpnSafetyStatus(_c);
                             final err = _c.error.value;
                             final transport = _c.activeTransport.value;
-                            final stealthWait = stage == VpnStage.connecting &&
+                            final stealthWait =
+                                stage == VpnStage.connecting &&
                                 transport != null &&
                                 transport != Transport.wireguard;
-                            final stalled = stage == VpnStage.connected && !_c.tunnelHealthy.value;
+                            final stalled =
+                                stage == VpnStage.connected &&
+                                !_c.tunnelHealthy.value;
                             return Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 RepaintBoundary(
                                   child: ConnectDial(
-                                    stage: blocking ? VpnStage.error : stage,
+                                    stage: stage,
+                                    status: status,
                                     durationLabel: fmtDuration(_elapsed.value),
                                     connectingLabel: _connectingLabel(stage),
                                     // Connecting stays tappable: it cancels. Only a
                                     // disconnect in flight is uninterruptible.
-                                    onTap: stage == VpnStage.disconnecting ? null : _onDialTap,
+                                    onTap: stage == VpnStage.disconnecting
+                                        ? null
+                                        : _onDialTap,
                                   ),
                                 ),
                                 if (stealthWait) ...[
                                   const SizedBox(height: 14),
                                   Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
                                     child: Text(
                                       'Disguising traffic — this can take up to a minute on strict networks.',
                                       textAlign: TextAlign.center,
-                                      style: grotesk(size: 12.5, weight: FontWeight.w500, color: AppColors.textMuted),
+                                      style: grotesk(
+                                        size: 12.5,
+                                        weight: FontWeight.w500,
+                                        color: AppColors.textMuted,
+                                      ),
                                     ),
                                   ),
                                 ],
                                 if (stalled) ...[
                                   const SizedBox(height: 14),
                                   Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
                                     child: Text(
-                                      'Tunnel is up but nothing is getting through — tap the dial to disconnect, then reconnect (try Stealth).',
+                                      'Connection health checks are failing — tap the dial to disconnect, then reconnect (try Stealth).',
                                       textAlign: TextAlign.center,
-                                      style: grotesk(size: 12.5, weight: FontWeight.w500, color: AppColors.danger),
+                                      style: grotesk(
+                                        size: 12.5,
+                                        weight: FontWeight.w500,
+                                        color: AppColors.danger,
+                                      ),
                                     ),
                                   ),
                                 ],
                                 if (err != null && err.isNotEmpty) ...[
                                   const SizedBox(height: 14),
                                   Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
                                     child: Text(
                                       err,
                                       textAlign: TextAlign.center,
                                       maxLines: 3,
                                       overflow: TextOverflow.ellipsis,
-                                      style: grotesk(size: 12.5, weight: FontWeight.w500, color: AppColors.danger),
+                                      style: grotesk(
+                                        size: 12.5,
+                                        weight: FontWeight.w500,
+                                        color: AppColors.danger,
+                                      ),
                                     ),
                                   ),
                                 ],
@@ -266,7 +303,12 @@ class _ConnectViewState extends State<ConnectView> {
                 ),
               ),
               // data readout
-              Obx(() => _DataReadout(stats: _c.stats.value, connected: _c.isConnected)),
+              Obx(
+                () => _DataReadout(
+                  stats: _c.stats.value,
+                  connected: _c.isConnected,
+                ),
+              ),
               const SizedBox(height: 14),
               // server card
               Obx(() {
@@ -274,7 +316,9 @@ class _ConnectViewState extends State<ConnectView> {
                 final node = _c.selectedNode.value;
                 final registryEmpty = gw.nodes.isEmpty;
                 final display = registryEmpty
-                    ? NodeDisplay.placeholder(registryError: gw.error.value != null)
+                    ? NodeDisplay.placeholder(
+                        registryError: gw.error.value != null,
+                      )
                     : NodeDisplay.of(node, showActivity: true);
                 // Reflect the selected node's source (public vs its org/workspace).
                 final org = node?.org;
@@ -295,8 +339,10 @@ class _ConnectViewState extends State<ConnectView> {
                       display: display,
                       egressIp: _c.egressIp.value,
                       egressLoading: _c.egressIpLoading.value,
-                      protocol: _c.activeTransport.value?.label ?? _c.mode.value.label,
-                      connected: _c.isConnected,
+                      protocol:
+                          _c.activeTransport.value?.label ??
+                          _c.mode.value.label,
+                      connected: _c.isProtected,
                       onTap: widget.onOpenServers,
                     ),
                   ],
@@ -311,40 +357,43 @@ class _ConnectViewState extends State<ConnectView> {
 }
 
 class _StatusHeader extends StatelessWidget {
-  const _StatusHeader({
-    required this.stage,
-    required this.blocking,
-    this.healthy = true,
-    this.onDiagnostics,
-  });
-  final VpnStage stage;
-  final bool blocking;
-  final bool healthy;
+  const _StatusHeader({required this.status, this.onDiagnostics});
+  final VpnSafetyStatus status;
   final VoidCallback? onDiagnostics;
 
   @override
   Widget build(BuildContext context) {
-    final label = blocking
-        ? 'TRAFFIC BLOCKED'
-        : switch (stage) {
-            VpnStage.connected => healthy ? 'PROTECTED' : 'TUNNEL STALLED',
-            VpnStage.connecting => 'SECURING TUNNEL',
-            VpnStage.disconnecting => 'DISCONNECTING',
-            VpnStage.error => 'NOT CONNECTED',
-            _ => 'NOT CONNECTED',
-          };
+    final label = status.label;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('STATUS', style: mono(size: 11, weight: FontWeight.w500, color: AppColors.textMuted, letterSpacing: 11 * 0.16)),
-            const SizedBox(height: 2),
-            Text(label, style: grotesk(size: 18, weight: FontWeight.w600, letterSpacing: -0.18)),
-          ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'STATUS',
+                style: mono(
+                  size: 11,
+                  weight: FontWeight.w500,
+                  color: AppColors.textMuted,
+                  letterSpacing: 11 * 0.16,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                style: grotesk(
+                  size: 18,
+                  weight: FontWeight.w600,
+                  color: status.color,
+                  letterSpacing: -0.18,
+                ),
+              ),
+            ],
+          ),
         ),
-        const Spacer(),
+        const SizedBox(width: 12),
         GestureDetector(
           onTap: onDiagnostics,
           child: Container(
@@ -357,10 +406,21 @@ class _StatusHeader extends StatelessWidget {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.show_chart, size: 16, color: AppColors.textSecondary),
+                const Icon(
+                  Icons.show_chart,
+                  size: 16,
+                  color: AppColors.textSecondary,
+                ),
                 const SizedBox(width: 7),
-                Text('DIAGNOSTICS',
-                    style: mono(size: 11, weight: FontWeight.w500, color: AppColors.textSecondary, letterSpacing: 11 * 0.06)),
+                Text(
+                  'DIAGNOSTICS',
+                  style: mono(
+                    size: 11,
+                    weight: FontWeight.w500,
+                    color: AppColors.textSecondary,
+                    letterSpacing: 11 * 0.06,
+                  ),
+                ),
               ],
             ),
           ),
@@ -371,7 +431,11 @@ class _StatusHeader extends StatelessWidget {
 }
 
 class _ProtocolSegment extends StatelessWidget {
-  const _ProtocolSegment({required this.mode, required this.enabled, required this.onSelect});
+  const _ProtocolSegment({
+    required this.mode,
+    required this.enabled,
+    required this.onSelect,
+  });
   final ConnectMode mode;
   final bool enabled;
   final ValueChanged<ConnectMode> onSelect;
@@ -387,11 +451,23 @@ class _ProtocolSegment extends StatelessWidget {
       ),
       child: Row(
         children: [
-          _seg('AUTO', mode == ConnectMode.auto, () => onSelect(ConnectMode.auto)),
+          _seg(
+            'AUTO',
+            mode == ConnectMode.auto,
+            () => onSelect(ConnectMode.auto),
+          ),
           const SizedBox(width: 4),
-          _seg('WIREGUARD', mode == ConnectMode.wireguard, () => onSelect(ConnectMode.wireguard)),
+          _seg(
+            'WIREGUARD',
+            mode == ConnectMode.wireguard,
+            () => onSelect(ConnectMode.wireguard),
+          ),
           const SizedBox(width: 4),
-          _seg('STEALTH', mode == ConnectMode.stealth, () => onSelect(ConnectMode.stealth)),
+          _seg(
+            'STEALTH',
+            mode == ConnectMode.stealth,
+            () => onSelect(ConnectMode.stealth),
+          ),
         ],
       ),
     );
@@ -450,7 +526,11 @@ class _DataReadout extends StatelessWidget {
                 value: connected ? fmtData(stats.rxBytes) : '0 KB',
               ),
             ),
-            const VerticalDivider(width: 1, thickness: 1, color: AppColors.strokeSoft),
+            const VerticalDivider(
+              width: 1,
+              thickness: 1,
+              color: AppColors.strokeSoft,
+            ),
             Expanded(
               child: _TrafficStat(
                 label: 'UPLOAD',
@@ -466,7 +546,11 @@ class _DataReadout extends StatelessWidget {
 }
 
 class _TrafficStat extends StatelessWidget {
-  const _TrafficStat({required this.label, required this.arrow, required this.value});
+  const _TrafficStat({
+    required this.label,
+    required this.arrow,
+    required this.value,
+  });
   final String label;
   final String arrow;
   final String value;
@@ -481,11 +565,23 @@ class _TrafficStat extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(arrow, style: mono(size: 11, weight: FontWeight.w500, color: AppColors.textMuted)),
+            Text(
+              arrow,
+              style: mono(
+                size: 11,
+                weight: FontWeight.w500,
+                color: AppColors.textMuted,
+              ),
+            ),
             const SizedBox(width: 4),
             Text(
               label,
-              style: mono(size: 11, weight: FontWeight.w400, color: AppColors.textMuted, letterSpacing: 11 * 0.08),
+              style: mono(
+                size: 11,
+                weight: FontWeight.w400,
+                color: AppColors.textMuted,
+                letterSpacing: 11 * 0.08,
+              ),
             ),
           ],
         ),
@@ -493,7 +589,11 @@ class _TrafficStat extends StatelessWidget {
         Text(
           value,
           textAlign: TextAlign.center,
-          style: mono(size: 15, weight: FontWeight.w600, color: AppColors.textPrimary),
+          style: mono(
+            size: 15,
+            weight: FontWeight.w600,
+            color: AppColors.textPrimary,
+          ),
         ),
       ],
     );
@@ -538,7 +638,11 @@ class _ServerCard extends StatelessWidget {
                 color: AppColors.accent.withValues(alpha: 0.12),
                 borderRadius: BorderRadius.circular(12),
               ),
-              child: Icon(Icons.hub_outlined, size: 22, color: AppColors.accent.withValues(alpha: 0.9)),
+              child: Icon(
+                Icons.hub_outlined,
+                size: 22,
+                color: AppColors.accent.withValues(alpha: 0.9),
+              ),
             ),
             const SizedBox(width: 13),
             Expanded(
@@ -549,22 +653,28 @@ class _ServerCard extends StatelessWidget {
                     d.name,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: mono(size: 14, weight: FontWeight.w600, color: AppColors.textPrimary),
+                    style: mono(
+                      size: 14,
+                      weight: FontWeight.w600,
+                      color: AppColors.textPrimary,
+                    ),
                   ),
                   const SizedBox(height: 3),
                   Text(
                     d.location,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: grotesk(size: 12, weight: FontWeight.w400, color: AppColors.textTertiary),
+                    style: grotesk(
+                      size: 12,
+                      weight: FontWeight.w400,
+                      color: AppColors.textTertiary,
+                    ),
                   ),
                 ],
               ),
             ),
           ] else
-            Expanded(
-              child: NodeCompactRow(display: d, nameSize: 14),
-            ),
+            Expanded(child: NodeCompactRow(display: d, nameSize: 14)),
           const SizedBox(width: 10),
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
@@ -580,7 +690,11 @@ class _ServerCard extends StatelessWidget {
                     if (d.showLoad) ...[
                       Text(
                         d.loadLabel,
-                        style: mono(size: 14, weight: FontWeight.w600, color: d.loadColor),
+                        style: mono(
+                          size: 14,
+                          weight: FontWeight.w600,
+                          color: d.loadColor,
+                        ),
                       ),
                       const SizedBox(width: 8),
                     ],
@@ -605,14 +719,19 @@ class _ServerCard extends StatelessWidget {
                         Text(
                           egressLoading
                               ? 'Egress · …'
-                              : (egressIp != null ? 'Egress · $egressIp' : 'Egress · —'),
+                              : (egressIp != null
+                                    ? 'Egress · $egressIp'
+                                    : 'Egress · —'),
                           style: mono(
                             size: 10,
                             weight: FontWeight.w500,
-                            color: egressIp != null ? AppColors.success : AppColors.textMuted,
+                            color: egressIp != null
+                                ? AppColors.success
+                                : AppColors.textMuted,
                           ),
                         ),
-                        if (protocolLabel != null && protocolLabel.isNotEmpty) ...[
+                        if (protocolLabel != null &&
+                            protocolLabel.isNotEmpty) ...[
                           const SizedBox(height: 3),
                           Text(
                             'Protocol · $protocolLabel',
@@ -657,8 +776,11 @@ class _ScopeStrip extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       child: Row(
         children: [
-          Icon(isOrg ? Icons.apartment_rounded : Icons.public,
-              size: 13, color: accent),
+          Icon(
+            isOrg ? Icons.apartment_rounded : Icons.public,
+            size: 13,
+            color: accent,
+          ),
           const SizedBox(width: 7),
           Text(
             'VPN SOURCE',
