@@ -45,4 +45,15 @@ void main() {
       expect(BrowserController.normalizeInput(kStartPage), kStartPage);
     });
   });
+
+  group('BrowserController.isWebUrl', () {
+    test('accepts only http(s) URLs with a host', () {
+      expect(BrowserController.isWebUrl('https://erebrus.io/a'), isTrue);
+      expect(BrowserController.isWebUrl('http://localhost:3000'), isTrue);
+      expect(BrowserController.isWebUrl('about:blank'), isFalse);
+      expect(BrowserController.isWebUrl('javascript:void(0)'), isFalse);
+      expect(BrowserController.isWebUrl('data:text/html,hi'), isFalse);
+      expect(BrowserController.isWebUrl(''), isFalse);
+    });
+  });
 }

@@ -62,6 +62,11 @@ class BrowserController extends GetxController {
 
   Timer? _tunnelReloadDebounce;
 
+  /// Last page-initiated new-tab request, used to drop duplicate posts (a
+  /// page can fire both a `_blank` click and `window.open` for one gesture).
+  String? _lastPageNewTabUrl;
+  DateTime _lastPageNewTabAt = DateTime.fromMillisecondsSinceEpoch(0);
+
   @override
   void onInit() {
     super.onInit();
@@ -182,6 +187,23 @@ class BrowserController extends GetxController {
     await navigate(trimmed);
   }
 
+  /// Opens a new tab requested by page content (`target="_blank"`,
+  /// `window.open`). Only real http(s) URLs qualify — `about:blank`,
+  /// `javascript:` and `data:` pop-ups are dropped rather than spawning
+  /// empty tabs.
+  void _openPageRequestedTab(String url) {
+    final trimmed = url.trim();
+    if (!isWebUrl(trimmed)) return;
+    final now = DateTime.now();
+    if (trimmed == _lastPageNewTabUrl &&
+        now.difference(_lastPageNewTabAt) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastPageNewTabUrl = trimmed;
+    _lastPageNewTabAt = now;
+    addTab(url: trimmed);
+  }
+
   /// Opens a link in a new tab without switching away from the current tab.
   void openInBackgroundTab(String url) {
     final trimmed = url.trim();
@@ -256,6 +278,10 @@ class BrowserController extends GetxController {
           linkContextMenuHandler?.call(hit);
         },
       )
+      ..addJavaScriptChannel(
+        kNewTabChannel,
+        onMessageReceived: (message) => _openPageRequestedTab(message.message),
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (_) => isLoading.value = true,
@@ -281,13 +307,11 @@ class BrowserController extends GetxController {
               '[Browser] resource error: ${error.description} (${error.errorCode})',
             );
           },
-          onNavigationRequest: (req) {
-            if (!req.isMainFrame) {
-              openInNewTab(req.url);
-              return NavigationDecision.prevent;
-            }
-            return NavigationDecision.navigate;
-          },
+          // Sub-frame navigations (iframes, embeds, about:blank shells) must
+          // load in place. New-tab links are routed by the injected script
+          // via [kNewTabChannel]; any remaining `_blank` target falls back
+          // to loading in this tab.
+          onNavigationRequest: (_) => NavigationDecision.navigate,
         ),
       );
   }
@@ -326,6 +350,13 @@ class BrowserController extends GetxController {
     }
 
     return braveSearchUrl(trimmed);
+  }
+
+  static bool isWebUrl(String url) {
+    final uri = Uri.tryParse(url);
+    return uri != null &&
+        (uri.scheme == 'http' || uri.scheme == 'https') &&
+        uri.host.isNotEmpty;
   }
 
   static bool _looksLikeWebHost(String host) {

@@ -16,8 +16,11 @@ class BrowserLinkHit {
 }
 
 /// JavaScript injected on each page load to capture link long-presses and
-/// forward them to the [kLinkContextMenuChannel] JavaScript channel.
+/// forward them to the [kLinkContextMenuChannel] JavaScript channel. It also
+/// routes `target="_blank"` links and `window.open` to [kNewTabChannel], so
+/// only real web pages the user asked for become new tabs.
 const kLinkContextMenuChannel = 'ErebrusLink';
+const kNewTabChannel = 'ErebrusNewTab';
 
 const kLinkContextMenuJs = '''
 (function () {
@@ -49,6 +52,19 @@ const kLinkContextMenuJs = '''
     }
   }
 
+  function isWebUrl(url) {
+    return typeof url === 'string' && /^https?:/i.test(url);
+  }
+
+  function openNewTab(url) {
+    if (!isWebUrl(url)) return false;
+    if (typeof ErebrusNewTab !== 'undefined' && ErebrusNewTab.postMessage) {
+      ErebrusNewTab.postMessage(url);
+      return true;
+    }
+    return false;
+  }
+
   function clearPress() {
     if (pressTimer) {
       clearTimeout(pressTimer);
@@ -61,8 +77,26 @@ const kLinkContextMenuJs = '''
     if (Date.now() < suppressClickUntil) {
       e.preventDefault();
       e.stopImmediatePropagation();
+      return;
+    }
+    var anchor = findAnchor(e.target);
+    if (!anchor) return;
+    var target = (anchor.getAttribute('target') || '').toLowerCase();
+    var wantsNewTab = target === '_blank' || e.metaKey || e.ctrlKey || e.button === 1;
+    if (wantsNewTab && openNewTab(anchor.href)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
     }
   }, true);
+
+  // Pop-ups become tabs only for real http(s) URLs; blank/scripted pop-ups
+  // (ads, about:blank shells) are dropped instead of spawning empty tabs.
+  window.open = function (url) {
+    var resolved = '';
+    try { resolved = url ? new URL(String(url), document.baseURI).href : ''; } catch (e) {}
+    openNewTab(resolved);
+    return null;
+  };
 
   document.addEventListener('touchstart', function (e) {
     var anchor = findAnchor(e.target);
