@@ -1,168 +1,155 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../platform/secure_storage.dart';
+import 'auth_session.dart';
 
-/// Persisted gateway session + optional Solana Mobile Wallet Adapter state.
-///
-/// Mobile uses Keychain/Keystore via [FlutterSecureStorage]. Desktop also mirrors
-/// to SharedPreferences so `flutter run -d macos` works when Keychain entitlements
-/// are missing (errSecMissingEntitlement / -34018 on ad-hoc signed debug builds).
+/// One Keychain/Keystore item is the commit unit for the entire session.
+/// Never use the desktop preferences fallback for authentication credentials.
 class AuthSessionStore {
-  AuthSessionStore({FlutterSecureStorage? storage})
-      : _storage = storage ?? ErebrusSecureStorage.instance;
+  AuthSessionStore({FlutterSecureStorage? storage, String? namespace})
+    : _storage = storage ?? ErebrusSecureStorage.instance,
+      _sessionKey = namespace == null
+          ? kSession
+          : '$kSession.${base64Url.encode(utf8.encode(namespace))}';
 
   final FlutterSecureStorage _storage;
-
+  final String _sessionKey;
+  static const kSession = 'com.erebrus.vpn.auth.session.v2';
   static const kToken = 'erebrus_gateway_token';
   static const kWallet = 'erebrus_wallet_address';
   static const kUserId = 'erebrus_user_id';
   static const kRole = 'erebrus_user_role';
   static const kAuthMethod = 'erebrus_auth_method';
   static const kMwaToken = 'erebrus_mwa_auth_token';
-
-  static const _prefsPrefix = 'erebrus_auth_';
+  static const _legacyKeys = [
+    kToken,
+    kWallet,
+    kUserId,
+    kRole,
+    kAuthMethod,
+    kMwaToken,
+  ];
 
   Future<StoredAuthSession?> read() async {
-    final secure = await _readSecure();
-    if (secure != null) return secure;
-    return _readPrefs();
+    _requireNative();
+    final blob = await _storage.read(key: _sessionKey);
+    if (blob != null) {
+      // A tombstone prevents resurrection from old, partially removed keys.
+      final json = jsonDecode(blob) as Map<String, dynamic>;
+      if (json['signed_out'] == true) return null;
+      return StoredAuthSession.fromJson(json);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.reload();
+    final token =
+        await _storage.read(key: kToken) ??
+        prefs.getString('erebrus_auth_$kToken');
+    if (token == null || token.isEmpty) return null;
+    Future<String?> legacy(String key) async =>
+        await _storage.read(key: key) ?? prefs.getString('erebrus_auth_$key');
+    final migrated = StoredAuthSession(
+      credentials: AuthSession(
+        token: token,
+        walletAddress: await legacy(kWallet) ?? '',
+        userId: await legacy(kUserId) ?? '',
+        role: await legacy(kRole) ?? 'user',
+      ),
+      authMethod: await legacy(kAuthMethod) ?? 'reown',
+      mwaAuthToken: await legacy(kMwaToken),
+    );
+    await write(migrated);
+    return migrated;
   }
 
-  Future<void> write({
-    required String token,
-    required String walletAddress,
-    required String userId,
-    required String role,
-    required String authMethod,
-    String? mwaAuthToken,
-  }) async {
-    final session = StoredAuthSession(
-      token: token,
-      walletAddress: walletAddress,
-      userId: userId,
-      role: role,
-      authMethod: authMethod,
-      mwaAuthToken: mwaAuthToken,
-    );
-
-    final secureOk = await _writeSecure(session);
-    if (secureOk) return;
-    await _writePrefs(session);
-    debugPrint('[Auth] session saved (prefs fallback — secure storage unavailable)');
+  Future<void> write(StoredAuthSession session) async {
+    _requireNative();
+    await _storage.write(key: _sessionKey, value: jsonEncode(session.toJson()));
+    await _removeLegacy();
   }
 
   Future<void> clear() async {
-    await _clearPrefs();
-    for (final key in [kToken, kWallet, kUserId, kRole, kAuthMethod, kMwaToken]) {
-      try {
-        await _storage.delete(key: key);
-      } on PlatformException catch (e) {
-        debugPrint('[Auth] secure storage delete failed for $key: ${e.message}');
-      } catch (e) {
-        debugPrint('[Auth] secure storage delete failed for $key: $e');
-      }
-    }
+    _requireNative();
+    await _storage.write(key: _sessionKey, value: '{"signed_out":true}');
+    await _removeLegacy();
   }
 
-  Future<StoredAuthSession?> _readSecure() async {
-    try {
-      final token = await _storage.read(key: kToken);
-      if (token == null || token.isEmpty) return null;
-      return StoredAuthSession(
-        token: token,
-        walletAddress: await _storage.read(key: kWallet) ?? '',
-        userId: await _storage.read(key: kUserId) ?? '',
-        role: await _storage.read(key: kRole) ?? 'user',
-        authMethod: await _storage.read(key: kAuthMethod) ?? 'reown',
-        mwaAuthToken: await _storage.read(key: kMwaToken),
-      );
-    } catch (e) {
-      debugPrint('[Auth] secure storage read failed: $e');
-      return null;
-    }
-  }
-
-  Future<bool> _writeSecure(StoredAuthSession session) async {
-    try {
-      await _storage.write(key: kToken, value: session.token);
-      await _storage.write(key: kWallet, value: session.walletAddress);
-      await _storage.write(key: kUserId, value: session.userId);
-      await _storage.write(key: kRole, value: session.role);
-      await _storage.write(key: kAuthMethod, value: session.authMethod);
-      if (session.mwaAuthToken != null && session.mwaAuthToken!.isNotEmpty) {
-        await _storage.write(key: kMwaToken, value: session.mwaAuthToken);
-      } else {
-        await _storage.delete(key: kMwaToken);
-      }
-      return true;
-    } on PlatformException catch (e) {
-      debugPrint('[Auth] secure storage write failed: ${e.message}');
-      return false;
-    } catch (e) {
-      debugPrint('[Auth] secure storage write failed: $e');
-      return false;
-    }
-  }
-
-  Future<StoredAuthSession?> _readPrefs() async {
+  Future<void> _removeLegacy() async {
+    // Best effort after the atomic commit; old copies are never authoritative.
     try {
       final prefs = await SharedPreferences.getInstance();
-      final token = prefs.getString('$_prefsPrefix$kToken');
-      if (token == null || token.isEmpty) return null;
-      return StoredAuthSession(
-        token: token,
-        walletAddress: prefs.getString('$_prefsPrefix$kWallet') ?? '',
-        userId: prefs.getString('$_prefsPrefix$kUserId') ?? '',
-        role: prefs.getString('$_prefsPrefix$kRole') ?? 'user',
-        authMethod: prefs.getString('$_prefsPrefix$kAuthMethod') ?? 'web',
-        mwaAuthToken: prefs.getString('$_prefsPrefix$kMwaToken'),
+      for (final key in _legacyKeys) {
+        await prefs.remove('erebrus_auth_$key');
+        await _storage.delete(key: key);
+      }
+    } catch (_) {}
+  }
+
+  void _requireNative() {
+    if (kIsWeb) {
+      throw UnsupportedError(
+        'Browser login requires a server-side HttpOnly session.',
       );
-    } catch (e) {
-      debugPrint('[Auth] prefs session read failed: $e');
-      return null;
-    }
-  }
-
-  Future<void> _writePrefs(StoredAuthSession session) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('$_prefsPrefix$kToken', session.token);
-    await prefs.setString('$_prefsPrefix$kWallet', session.walletAddress);
-    await prefs.setString('$_prefsPrefix$kUserId', session.userId);
-    await prefs.setString('$_prefsPrefix$kRole', session.role);
-    await prefs.setString('$_prefsPrefix$kAuthMethod', session.authMethod);
-    final mwa = session.mwaAuthToken;
-    if (mwa != null && mwa.isNotEmpty) {
-      await prefs.setString('$_prefsPrefix$kMwaToken', mwa);
-    } else {
-      await prefs.remove('$_prefsPrefix$kMwaToken');
-    }
-  }
-
-  Future<void> _clearPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    for (final key in [kToken, kWallet, kUserId, kRole, kAuthMethod, kMwaToken]) {
-      await prefs.remove('$_prefsPrefix$key');
     }
   }
 }
 
 class StoredAuthSession {
   const StoredAuthSession({
-    required this.token,
-    required this.walletAddress,
-    required this.userId,
-    required this.role,
+    required this.credentials,
     required this.authMethod,
     this.mwaAuthToken,
+    this.renewalUncertain = false,
+    this.loginRequired = false,
+    this.retryAt,
   });
-
-  final String token;
-  final String walletAddress;
-  final String userId;
-  final String role;
+  final AuthSession credentials;
   final String authMethod;
   final String? mwaAuthToken;
+  final bool renewalUncertain;
+  final bool loginRequired;
+  final DateTime? retryAt;
+  String get token => credentials.token;
+  String get walletAddress => credentials.walletAddress;
+  String get userId => credentials.userId;
+  String get role => credentials.role;
+
+  StoredAuthSession withCredentials(AuthSession credentials) =>
+      StoredAuthSession(
+        credentials: credentials,
+        authMethod: authMethod,
+        mwaAuthToken: mwaAuthToken,
+      );
+  StoredAuthSession withStatus({
+    bool uncertain = false,
+    bool loginRequired = false,
+    DateTime? retryAt,
+  }) => StoredAuthSession(
+    credentials: credentials,
+    authMethod: authMethod,
+    mwaAuthToken: mwaAuthToken,
+    renewalUncertain: uncertain,
+    loginRequired: loginRequired,
+    retryAt: retryAt,
+  );
+  Map<String, dynamic> toJson() => {
+    ...credentials.toJson(),
+    'auth_method': authMethod,
+    'mwa_auth_token': mwaAuthToken,
+    'renewal_uncertain': renewalUncertain,
+    'login_required': loginRequired,
+    'retry_at': retryAt?.toUtc().toIso8601String(),
+  };
+  factory StoredAuthSession.fromJson(Map<String, dynamic> json) =>
+      StoredAuthSession(
+        credentials: AuthSession.fromJson(json),
+        authMethod: json['auth_method'] as String,
+        mwaAuthToken: json['mwa_auth_token'] as String?,
+        renewalUncertain: json['renewal_uncertain'] == true,
+        loginRequired: json['login_required'] == true,
+        retryAt: DateTime.tryParse('${json['retry_at']}'),
+      );
 }

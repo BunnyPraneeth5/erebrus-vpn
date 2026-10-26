@@ -18,13 +18,19 @@ String friendlyGatewayError(Object error, {String? nodeName}) {
   if (lower.contains('private node') || lower.contains('org membership')) {
     return 'This is a private org node — you need membership to connect';
   }
-  if (lower.contains('node unreachable') || lower.contains('no reachable api')) {
+  if (lower.contains('node unreachable') ||
+      lower.contains('no reachable api')) {
     return 'Gateway cannot reach $node (port 9080). '
         'The node may need to re-register with the gateway, or the server '
         'firewall must allow the gateway to call the node API.';
   }
+  if (error is GatewayException && error.isDeviceLimitReached) {
+    return 'Connected-device limit reached — disconnect another device and try again';
+  }
   if (lower.contains('client limit')) {
-    return 'Client limit reached for your plan — remove an old device in Account';
+    // Older gateways may still reject a saved-config count. Deleting configs
+    // is not the connected-device policy and must not be suggested as a fix.
+    return 'The server rejected this VPN config. Saved configs do not use connected-device slots.';
   }
   if (lower.contains('node not found')) {
     return 'Node no longer registered — refresh Servers and pick another node';

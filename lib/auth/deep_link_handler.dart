@@ -39,7 +39,7 @@ class DeepLinkHandler {
     final url = link.toString();
     final auth = _auth;
     if (auth == null) {
-      debugPrint('[DeepLinkHandler] auth not bound for $url');
+      debugPrint('[DeepLinkHandler] auth not bound');
       return;
     }
 
@@ -50,12 +50,12 @@ class DeepLinkHandler {
 
     final modal = auth.appKitModal;
     if (modal == null) {
-      debugPrint('[DeepLinkHandler] unhandled link (no Reown session): $url');
+      debugPrint('[DeepLinkHandler] unhandled link (no Reown session)');
       return;
     }
     final handled = await modal.dispatchEnvelope(url);
     if (!handled) {
-      debugPrint('[DeepLinkHandler] Reown did not handle: $url');
+      debugPrint('[DeepLinkHandler] Reown did not handle link');
     }
   }
 

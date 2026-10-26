@@ -1,24 +1,31 @@
-import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'gateway_config.dart';
+import '../auth/auth_repository.dart';
+import '../auth/session_exception.dart';
+import '../auth/session_transport.dart';
 import 'gateway_http.dart';
 import 'vpn_models.dart';
 
-export 'gateway_config.dart' show kDefaultGatewayUrl, kGatewayUrl, kTrialPeriodDays, resolveGatewayUrl;
+export 'gateway_config.dart'
+    show kDefaultGatewayUrl, kGatewayUrl, kTrialPeriodDays, resolveGatewayUrl;
 
 /// Thin HTTP client for the Erebrus gateway discovery + provisioning APIs.
 class GatewayClient {
-  GatewayClient({String? baseUrl, this._bearerToken})
-    : _base = GatewayHttp.normalizeBase(baseUrl ?? resolveGatewayUrl());
+  GatewayClient({
+    String? baseUrl,
+    this._bearerToken,
+    AuthRepository? sessions,
+    SessionSender? sender,
+  }) : _base = GatewayHttp.normalizeBase(baseUrl ?? resolveGatewayUrl()),
+       sessions = sessions ?? AuthRepository(gatewayUrl: baseUrl),
+       _send = sender ?? sendSessionRequest;
 
   final Uri _base;
   String? _bearerToken;
 
-  /// Notifies the auth owner when a bearer-authenticated gateway call returns
-  /// 401. Public failures and permission-denied responses do not trigger it.
-  Future<void> Function()? onSessionExpired;
+  AuthRepository sessions;
+  final SessionSender _send;
 
   void setBearerToken(String? token) => _bearerToken = token;
 
@@ -38,11 +45,14 @@ class GatewayClient {
         return _parseNodes(decoded);
       } on GatewayException catch (e) {
         lastError = e;
-        final is404 = e.message.contains('404') || e.message.toLowerCase().contains('not found');
+        final is404 =
+            e.message.contains('404') ||
+            e.message.toLowerCase().contains('not found');
         if (!is404) rethrow;
       }
     }
-    throw lastError ?? GatewayException('Gateway registry not found at $baseUrl');
+    throw lastError ??
+        GatewayException('Gateway registry not found at $baseUrl');
   }
 
   /// Fetches the nodes belonging to every org the signed-in user is a member of
@@ -50,7 +60,9 @@ class GatewayClient {
   /// an embedded `org` summary used to group nodes by organization. Requires a
   /// bearer token; returns an empty list when unauthenticated.
   Future<List<VpnNode>> fetchOrgNodes() async {
-    if (_bearerToken == null || _bearerToken!.isEmpty) return const [];
+    if (_bearerToken == null && await sessions.restore() == null) {
+      return const [];
+    }
     final decoded = await _getJson('/api/v2/operator/nodes');
     return _parseNodes(decoded);
   }
@@ -58,7 +70,9 @@ class GatewayClient {
   /// Fetches the organizations the signed-in user belongs to (`GET /api/v2/orgs`).
   /// Requires a bearer token; returns an empty list when unauthenticated.
   Future<List<VpnOrg>> fetchOrgs() async {
-    if (_bearerToken == null || _bearerToken!.isEmpty) return const [];
+    if (_bearerToken == null && await sessions.restore() == null) {
+      return const [];
+    }
     final decoded = await _getJson('/api/v2/orgs');
     final list = decoded is List
         ? decoded
@@ -99,7 +113,8 @@ class GatewayClient {
         'wg_public_key': wgPublicKey,
       });
       return CredentialBundle.fromJson(_unwrapBundle(decoded));
-    } on GatewayException {
+    } on GatewayException catch (e) {
+      if (e.blocksProvisioningFallback) rethrow;
       final reused = await fetchExistingClientBundle(
         nodeId: nodeId,
         wgPublicKey: wgPublicKey,
@@ -121,6 +136,8 @@ class GatewayClient {
         if (c.status == 'deleting') continue;
         return await fetchClientConfig(c.id);
       }
+    } on GatewayException catch (e) {
+      if (e.blocksAuthenticatedRequest) rethrow;
     } catch (_) {}
     return null;
   }
@@ -168,81 +185,62 @@ class GatewayClient {
     Map<String, String>? query,
   }) async {
     final uri = GatewayHttp.apiUri(_base, path: path, query: query);
-    Object? lastError;
-    for (var attempt = 0; attempt < 2; attempt++) {
-      if (attempt == 0) {
-        try {
-          await GatewayHttp.preflightHost(uri.host);
-        } on Object catch (e) {
-          lastError = e;
-          if (GatewayHttp.isTransientNetworkError(e)) {
-            await Future<void>.delayed(const Duration(milliseconds: 400));
-            continue;
-          }
-          rethrow;
-        }
+    final encoded = body == null ? null : jsonEncode(body);
+    try {
+      final repository = sessions;
+      final response = path != '/api/v2/nodes'
+          ? await repository.request(method, uri, body: encoded)
+          : await _send(method, uri, body: encoded);
+      if (!response.ok) {
+        throw GatewayException(
+          response.error.message,
+          statusCode: response.status,
+          code: response.code,
+          retryAt: response.retryAt,
+        );
       }
-      final client = GatewayHttp.createClient();
-      try {
-        final req = await client.openUrl(method, uri);
-        GatewayHttp.applyHeaders(req, bearerToken: _bearerToken, jsonBody: body != null);
-        if (body != null) {
-          final encoded = jsonEncode(body);
-          req.contentLength = utf8.encode(encoded).length;
-          req.write(encoded);
-        }
-        final res = await req.close();
-        final text = await utf8.decodeStream(res);
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          final hadBearer = _bearerToken != null && _bearerToken!.isNotEmpty;
-          final error = GatewayException(
-            GatewayHttp.errorMessage(res.statusCode, text),
-            statusCode: res.statusCode,
-            code: GatewayHttp.errorCode(text),
-          );
-          if (hadBearer && error.isSessionExpired) {
-            // Do not await here: a 401 may originate inside GatewayController's
-            // own refresh operation, while logout also resets that controller.
-            // Waiting would create a refresh -> logout -> refresh cycle.
-            final callback = onSessionExpired;
-            if (callback != null) unawaited(callback());
-          }
-          throw error;
-        }
-        if (text.isEmpty) return const {};
-        return jsonDecode(text);
-      } on SocketException catch (e) {
-        lastError = e;
-        if (attempt == 0 && GatewayHttp.isTransientNetworkError(e)) {
-          await Future<void>.delayed(const Duration(milliseconds: 400));
-          continue;
-        }
-        throw GatewayException('Cannot reach $baseUrl (${e.message})');
-      } on TimeoutException catch (e) {
-        lastError = e;
-        if (attempt == 0) {
-          await Future<void>.delayed(const Duration(milliseconds: 400));
-          continue;
-        }
-        throw GatewayException('Cannot reach $baseUrl (timed out)');
-      } on FormatException {
-        throw GatewayException('Gateway returned invalid JSON');
-      } finally {
-        client.close(force: true);
-      }
+      return response.body.isEmpty
+          ? <String, dynamic>{}
+          : jsonDecode(response.body);
+    } on AuthException catch (e) {
+      throw GatewayException(
+        e.message,
+        statusCode: e.statusCode,
+        code: e.code,
+        retryAt: e.retryAt,
+      );
+    } on FormatException {
+      throw GatewayException('Gateway returned invalid JSON');
     }
-    throw GatewayException('Cannot reach $baseUrl (${lastError ?? 'unknown error'})');
   }
-
 }
 
 class GatewayException implements Exception {
-  GatewayException(this.message, {this.statusCode, this.code});
+  GatewayException(this.message, {this.statusCode, this.code, this.retryAt});
   final String message;
   final int? statusCode;
   final String? code;
+  final DateTime? retryAt;
 
-  bool get isSessionExpired => statusCode == HttpStatus.unauthorized;
+  bool get isSessionExpired => const {
+    'REFRESH_TOKEN_INVALID',
+    'REFRESH_TOKEN_REUSED',
+    'SESSION_REVOKED',
+  }.contains(code);
+
+  /// A quota rejection is authoritative; cached configs must not bypass it.
+  bool get isDeviceLimitReached => code == 'DEVICE_LIMIT_REACHED';
+
+  bool get blocksProvisioningFallback =>
+      blocksAuthenticatedRequest || isDeviceLimitReached;
+
+  bool get blocksAuthenticatedRequest =>
+      isSessionExpired ||
+      statusCode == 401 ||
+      code == 'SESSION_CHANGED' ||
+      code == 'LOGIN_REQUIRED' ||
+      code == 'SESSION_STORAGE_ERROR' ||
+      code == 'SESSION_OWNER_UNAVAILABLE';
 
   @override
   String toString() => message;

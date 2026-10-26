@@ -3,6 +3,13 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'auth_config.dart';
+import 'auth_repository.dart';
+import 'auth_session.dart';
+import 'session_exception.dart';
+import 'session_transport.dart';
+
+export 'auth_session.dart';
+export 'session_exception.dart';
 import 'entitlement_state.dart';
 import 'rank_summary.dart';
 import 'referral_summary.dart';
@@ -16,16 +23,20 @@ export 'user_org_invite.dart';
 
 /// Wallet auth + subscriptions against the Erebrus gateway (v2).
 class GatewayAuthClient {
-  GatewayAuthClient({String? gatewayUrl})
-    : _base = GatewayHttp.normalizeBase(gatewayUrl ?? resolveGatewayUrl());
+  GatewayAuthClient({
+    String? gatewayUrl,
+    AuthRepository? sessions,
+    SessionSender? sender,
+  }) : _base = GatewayHttp.normalizeBase(gatewayUrl ?? resolveGatewayUrl()),
+       _send = sender ?? sendSessionRequest,
+       sessions = sessions ?? AuthRepository(gatewayUrl: gatewayUrl);
 
-  static const _requestTimeout = Duration(seconds: 20);
+  AuthRepository sessions;
+  final SessionSender _send;
 
   final Uri _base;
 
-  /// Called when an authenticated request proves that the user session is no
-  /// longer valid. The controller uses this to clear stale persisted state.
-  Future<void> Function()? onSessionExpired;
+  String get gatewayUrl => _base.toString();
 
   String get baseUrl {
     final port = _base.hasPort ? ':${_base.port}' : '';
@@ -104,12 +115,7 @@ class GatewayAuthClient {
       GatewayHttp.apiUri(_base, path: '/api/v2/auth'),
       body,
     );
-    return AuthSession(
-      token: (map['token'] ?? '').toString(),
-      userId: (map['user_id'] ?? '').toString(),
-      role: (map['role'] ?? 'user').toString(),
-      walletAddress: publicKey,
-    );
+    return AuthSession.fromJson(map, walletAddress: publicKey);
   }
 
   /// `GET /api/v2/auth/methods` — which login methods the gateway has configured.
@@ -143,7 +149,7 @@ class GatewayAuthClient {
       GatewayHttp.apiUri(_base, path: '/api/v2/auth/email/login/verify'),
       {'email': email.trim(), 'code': normalizedCode},
     );
-    return _identitySession(map);
+    return AuthSession.fromJson(map);
   }
 
   /// `POST /api/v2/auth/google` — exchange a Google id_token for a session.
@@ -152,7 +158,7 @@ class GatewayAuthClient {
       GatewayHttp.apiUri(_base, path: '/api/v2/auth/google'),
       {'id_token': idToken},
     );
-    return _identitySession(map);
+    return AuthSession.fromJson(map);
   }
 
   /// `POST /api/v2/auth/apple` — exchange the complete Apple credential.
@@ -171,7 +177,7 @@ class GatewayAuthClient {
         state: state,
       ),
     );
-    return _identitySession(map);
+    return AuthSession.fromJson(map);
   }
 
   static Map<String, String> appleLoginPayload({
@@ -185,13 +191,6 @@ class GatewayAuthClient {
     'nonce': nonce,
     'state': state,
   };
-
-  AuthSession _identitySession(Map<String, dynamic> map) => AuthSession(
-    token: (map['token'] ?? '').toString(),
-    userId: (map['user_id'] ?? '').toString(),
-    role: (map['role'] ?? 'user').toString(),
-    walletAddress: '',
-  );
 
   /// `GET /api/v2/subscriptions` — requires bearer token.
   Future<EntitlementState> fetchSubscription(String bearerToken) async {
@@ -378,143 +377,52 @@ class GatewayAuthClient {
     return VpnOrg.fromJson(map);
   }
 
-  Future<dynamic> _getDecoded(Uri uri, {String? bearerToken}) async {
-    final client = GatewayHttp.createClient();
-    try {
-      final req = await client.getUrl(uri).timeout(_requestTimeout);
-      GatewayHttp.applyHeaders(req, bearerToken: bearerToken);
-      final res = await req.close().timeout(_requestTimeout);
-      final text = await utf8.decodeStream(res).timeout(_requestTimeout);
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        await _throwResponseError(
-          res.statusCode,
-          text,
-          authenticated: bearerToken != null && bearerToken.isNotEmpty,
-        );
-      }
-      return jsonDecode(text);
-    } on SocketException catch (e) {
-      throw AuthException(_networkErrorMessage(e.message, gateway: baseUrl));
-    } on TimeoutException {
-      throw AuthException(
-        'Gateway request timed out — check your connection and try again',
-      );
-    } finally {
-      client.close(force: true);
-    }
+  Future<SessionResponse> _request(
+    String method,
+    Uri uri, {
+    String? bearerToken,
+    Map<String, dynamic>? body,
+  }) async {
+    final encoded = body == null ? null : jsonEncode(body);
+    final repository = sessions;
+    final response = bearerToken != null
+        ? await repository.request(method, uri, body: encoded)
+        : await _send(method, uri, bearerToken: bearerToken, body: encoded);
+    if (!response.ok) throw response.error;
+    return response;
   }
 
-  Future<Map<String, dynamic>> _getJson(Uri uri, {String? bearerToken}) async {
-    final decoded = await _getDecoded(uri, bearerToken: bearerToken);
-    return Map<String, dynamic>.from(decoded as Map);
+  Future<dynamic> _getDecoded(Uri uri, {String? bearerToken}) async {
+    final response = await _request('GET', uri, bearerToken: bearerToken);
+    return response.body.isEmpty
+        ? <String, dynamic>{}
+        : jsonDecode(response.body);
   }
+
+  Future<Map<String, dynamic>> _getJson(Uri uri, {String? bearerToken}) async =>
+      Map<String, dynamic>.from(
+        await _getDecoded(uri, bearerToken: bearerToken) as Map,
+      );
 
   Future<Map<String, dynamic>> _patchJson(
     Uri uri,
     Map<String, dynamic> body, {
     String? bearerToken,
-  }) async {
-    final client = GatewayHttp.createClient();
-    try {
-      final req = await client.patchUrl(uri).timeout(_requestTimeout);
-      GatewayHttp.applyHeaders(req, bearerToken: bearerToken, jsonBody: true);
-      final encoded = jsonEncode(body);
-      req.contentLength = utf8.encode(encoded).length;
-      req.write(encoded);
-      final res = await req.close().timeout(_requestTimeout);
-      final text = await utf8.decodeStream(res).timeout(_requestTimeout);
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        await _throwResponseError(
-          res.statusCode,
-          text,
-          authenticated: bearerToken != null && bearerToken.isNotEmpty,
-        );
-      }
-      if (text.isEmpty) return const {};
-      final decoded = jsonDecode(text);
-      if (decoded is Map) return Map<String, dynamic>.from(decoded);
-      return const {};
-    } on SocketException catch (e) {
-      throw AuthException(_networkErrorMessage(e.message, gateway: baseUrl));
-    } on TimeoutException {
-      throw AuthException(
-        'Gateway request timed out — check your connection and try again',
-      );
-    } finally {
-      client.close(force: true);
-    }
-  }
+  }) async =>
+      (await _request('PATCH', uri, body: body, bearerToken: bearerToken)).json;
 
   Future<Map<String, dynamic>> _postJson(
     Uri uri,
     Map<String, dynamic> body, {
     String? bearerToken,
-  }) async {
-    final client = GatewayHttp.createClient();
-    try {
-      final req = await client.postUrl(uri).timeout(_requestTimeout);
-      GatewayHttp.applyHeaders(req, bearerToken: bearerToken, jsonBody: true);
-      final encoded = jsonEncode(body);
-      req.contentLength = utf8.encode(encoded).length;
-      req.write(encoded);
-      final res = await req.close().timeout(_requestTimeout);
-      final text = await utf8.decodeStream(res).timeout(_requestTimeout);
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        await _throwResponseError(
-          res.statusCode,
-          text,
-          authenticated: bearerToken != null && bearerToken.isNotEmpty,
-        );
-      }
-      if (text.isEmpty) return const {};
-      final decoded = jsonDecode(text);
-      if (decoded is Map) return Map<String, dynamic>.from(decoded);
-      return const {};
-    } on SocketException catch (e) {
-      throw AuthException(_networkErrorMessage(e.message, gateway: baseUrl));
-    } on TimeoutException {
-      throw AuthException(
-        'Gateway request timed out — check your connection and try again',
-      );
-    } finally {
-      client.close(force: true);
-    }
-  }
-
-  Future<Never> _throwResponseError(
-    int statusCode,
-    String body, {
-    required bool authenticated,
-  }) async {
-    final error = AuthException(
-      GatewayHttp.errorMessage(statusCode, body),
-      statusCode: statusCode,
-      code: GatewayHttp.errorCode(body),
-    );
-    if (authenticated && error.isSessionExpired) {
-      await onSessionExpired?.call();
-    }
-    throw error;
-  }
+  }) async =>
+      (await _request('POST', uri, body: body, bearerToken: bearerToken)).json;
 }
 
 class AuthChallenge {
   const AuthChallenge({required this.challengeId, required this.message});
   final String challengeId;
   final String message;
-}
-
-class AuthSession {
-  const AuthSession({
-    required this.token,
-    required this.userId,
-    required this.role,
-    required this.walletAddress,
-  });
-  final String token;
-  final String userId;
-  final String role;
-  final String walletAddress;
 }
 
 /// Login methods the gateway has configured (`GET /api/v2/auth/methods`).
@@ -533,16 +441,4 @@ class AuthMethods {
   /// Optimistic default before the gateway responds: wallet + email shown,
   /// social providers stay hidden until confirmed (they also need app config).
   static const unknown = AuthMethods();
-}
-
-class AuthException implements Exception {
-  AuthException(this.message, {this.statusCode, this.code});
-  final String message;
-  final int? statusCode;
-  final String? code;
-
-  bool get isSessionExpired => statusCode == HttpStatus.unauthorized;
-
-  @override
-  String toString() => message;
 }

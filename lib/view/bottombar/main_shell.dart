@@ -85,10 +85,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       final vpn = Get.find<VpnController>();
       final settings = Get.find<AppSettingsController>();
-      final auth = Get.find<WalletAuthController>();
-      if (auth.isAuthenticated) {
-        unawaited(auth.refreshEntitlement());
-      }
       unawaited(vpn.syncWithNative().then((_) {
         settings.pingDiagnosticsIfEnabled(vpn: vpn);
       }));

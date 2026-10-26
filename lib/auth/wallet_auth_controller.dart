@@ -11,6 +11,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'auth_config.dart';
 import 'runtime_config.dart';
 import 'auth_session_store.dart';
+import 'auth_repository.dart';
 import 'deep_link_handler.dart';
 import 'desktop_web_auth.dart';
 import 'entitlement_state.dart';
@@ -26,15 +27,89 @@ import '../vpn/vpn_models.dart';
 import '../vpn/vpn_controller.dart';
 
 /// Wallet login via MWA on Solana Mobile, Reown elsewhere, and gateway v2 auth.
-class WalletAuthController extends GetxController {
-  WalletAuthController({GatewayAuthClient? authClient, AuthSessionStore? store})
-    : _authClient = authClient ?? GatewayAuthClient(),
-      _store = store ?? AuthSessionStore() {
-    _authClient.onSessionExpired = expireSession;
+class WalletAuthController extends GetxController with WidgetsBindingObserver {
+  WalletAuthController({
+    GatewayAuthClient? authClient,
+    AuthSessionStore? store,
+    AuthRepository? repository,
+  }) : _authClient = authClient ?? GatewayAuthClient(),
+       sessions =
+           repository ??
+           AuthRepository(store: store, gatewayUrl: authClient?.gatewayUrl) {
+    _authClient.sessions = sessions;
+    sessions.onChanged = (stored) {
+      if (stored != null) {
+        _applyStoredSession(stored);
+      } else {
+        final wasActive = isAuthenticated;
+        _applyToken(null);
+        _syncGatewayToken();
+        if (wasActive && !_signingOut) unawaited(expireSession());
+      }
+    };
   }
 
   final GatewayAuthClient _authClient;
-  final AuthSessionStore _store;
+  final AuthRepository sessions;
+  bool _signingOut = false;
+  int? _webLoginGeneration;
+  int? _walletLoginGeneration;
+
+  bool _mayStartLogin() {
+    if (_signingOut || _sessionExpiryInFlight != null) {
+      authError.value = 'Finishing sign-out. Try again in a moment.';
+      return false;
+    }
+    return true;
+  }
+
+  void _cancelProviderFlows() {
+    _webLoginGeneration = null;
+    _walletLoginGeneration = null;
+    awaitingWebCallback.value = false;
+    DesktopWebAuth.clearPendingState();
+  }
+
+  @override
+  void onInit() {
+    super.onInit();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) unawaited(restoreOnResume());
+  }
+
+  Future<void> restoreOnResume() async {
+    if (_signingOut) return;
+    if (!isAuthenticated) {
+      await loadPersistedSession();
+      return;
+    }
+    try {
+      await sessions.ensureFresh();
+      await refreshEntitlement();
+      await refreshProfile();
+    } on AuthException catch (e) {
+      authError.value = e.message;
+    } catch (_) {
+      authError.value = 'Could not restore the secure session.';
+    }
+  }
+
+  void _applyStoredSession(StoredAuthSession stored) {
+    if (userId.value.isNotEmpty && userId.value != stored.userId) {
+      _resetAccountData();
+    }
+    _applyToken(stored.token);
+    _mwaAuthToken = stored.mwaAuthToken;
+    walletAddress.value = stored.walletAddress;
+    userId.value = stored.userId;
+    role.value = stored.role;
+    authMethod.value = stored.authMethod;
+    _syncGatewayToken();
+  }
 
   ReownAppKitModal? appKitModal;
 
@@ -144,6 +219,7 @@ class WalletAuthController extends GetxController {
     required String email,
     required String code,
   }) async {
+    if (!_mayStartLogin()) return;
     final normalized = code.replaceAll(RegExp(r'\D'), '');
     if (normalized.length < 4) {
       authError.value = 'Enter the full code from your email';
@@ -151,6 +227,7 @@ class WalletAuthController extends GetxController {
     }
     authError.value = null;
     try {
+      final loginGeneration = await sessions.generation();
       final session = await _authClient.emailLoginVerify(
         email: email.trim().toLowerCase(),
         code: normalized,
@@ -160,7 +237,11 @@ class WalletAuthController extends GetxController {
         debugPrint('[Auth] email verify: empty token from gateway');
         return;
       }
-      await _persistSession(session, method: 'email');
+      await _persistSession(
+        session,
+        method: 'email',
+        generation: loginGeneration,
+      );
       await _afterLogin();
       debugPrint('[Auth] email login OK user=${session.userId}');
     } on AuthException catch (e) {
@@ -177,14 +258,20 @@ class WalletAuthController extends GetxController {
 
   /// Google sign-in via the native chooser → gateway session.
   Future<void> signInWithGoogle() async {
+    if (!_mayStartLogin()) return;
     if (isAuthenticating.value || !googleLoginAvailable) return;
     isAuthenticating.value = true;
     authError.value = null;
     try {
+      final loginGeneration = await sessions.generation();
       final idToken = await googleIdToken();
       if (idToken == null) return; // cancelled
       final session = await _authClient.googleLogin(idToken);
-      await _persistSession(session, method: 'google');
+      await _persistSession(
+        session,
+        method: 'google',
+        generation: loginGeneration,
+      );
       await _afterLogin();
       debugPrint('[Auth] google login OK');
     } on AuthException catch (e) {
@@ -200,10 +287,12 @@ class WalletAuthController extends GetxController {
 
   /// Apple sign-in via the native flow → gateway session.
   Future<void> signInWithApple() async {
+    if (!_mayStartLogin()) return;
     if (isAuthenticating.value || !appleLoginAvailable) return;
     isAuthenticating.value = true;
     authError.value = null;
     try {
+      final loginGeneration = await sessions.generation();
       final credential = await appleCredential();
       if (credential == null) return; // cancelled
       final session = await _authClient.appleLogin(
@@ -212,7 +301,11 @@ class WalletAuthController extends GetxController {
         nonce: credential.nonce,
         state: credential.state,
       );
-      await _persistSession(session, method: 'apple');
+      await _persistSession(
+        session,
+        method: 'apple',
+        generation: loginGeneration,
+      );
       await _afterLogin();
       debugPrint('[Auth] apple login OK');
     } on AuthException catch (e) {
@@ -233,6 +326,7 @@ class WalletAuthController extends GetxController {
 
   @override
   void onClose() {
+    WidgetsBinding.instance.removeObserver(this);
     appKitModal?.onModalConnect.unsubscribe(_onModalConnect);
     appKitModal?.onModalDisconnect.unsubscribe(_onModalDisconnect);
     appKitModal?.onModalError.unsubscribe(_onModalError);
@@ -250,15 +344,10 @@ class WalletAuthController extends GetxController {
   Future<void> loadPersistedSession() async {
     sessionReady.value = false;
     try {
-      final stored = await _store.read();
+      final stored = await sessions.restore();
       if (stored != null) {
-        _applyToken(stored.token);
-        _mwaAuthToken = stored.mwaAuthToken;
-        walletAddress.value = stored.walletAddress;
-        userId.value = stored.userId;
-        role.value = stored.role;
-        authMethod.value = stored.authMethod;
-        _syncGatewayToken();
+        _applyStoredSession(stored);
+        await sessions.ensureFresh();
         await refreshEntitlement();
         await refreshProfile();
         unawaited(refreshReferrals());
@@ -272,7 +361,9 @@ class WalletAuthController extends GetxController {
         entitlement.value = EntitlementState.none;
       }
     } catch (e) {
-      debugPrint('[Auth] restore failed: $e');
+      authError.value = e is AuthException
+          ? e.message
+          : 'Could not restore the secure session.';
     } finally {
       sessionReady.value = true;
     }
@@ -339,6 +430,7 @@ class WalletAuthController extends GetxController {
     );
 
     try {
+      _walletLoginGeneration = await sessions.generation();
       final pid = RuntimeConfig.reownProjectId;
       final projectHint = pid.length > 8 ? '${pid.substring(0, 8)}…' : pid;
       final packageInfo = await PackageInfo.fromPlatform();
@@ -391,12 +483,14 @@ class WalletAuthController extends GetxController {
 
   /// Opens erebrus.io in the system browser; PASETO returns via [kErebrusAuthCallback].
   Future<void> openWebSignIn() async {
+    if (!_mayStartLogin()) return;
     if (!usesWebLogin) return;
     if (isAuthenticating.value || awaitingWebCallback.value) return;
 
     authError.value = null;
     awaitingWebCallback.value = true;
     try {
+      _webLoginGeneration = await sessions.generation();
       final url = DesktopWebAuth.buildLoginUrl();
       debugPrint('[Auth] opening web login: $url');
       final uri = Uri.parse(url);
@@ -417,10 +511,12 @@ class WalletAuthController extends GetxController {
 
   /// Completes sign-in from pasted PASETO / callback URL (Postman-style fallback).
   Future<void> signInWithPastedCredential(String input) async {
+    if (!_mayStartLogin()) return;
     isAuthenticating.value = true;
     awaitingWebCallback.value = false;
     authError.value = null;
     try {
+      final loginGeneration = await sessions.generation();
       final callback = DesktopWebAuth.parseManualAuthInput(input);
       if (callback == null || callback.token.isEmpty) {
         authError.value =
@@ -432,8 +528,7 @@ class WalletAuthController extends GetxController {
       var wallet = callback.walletAddress;
       final role = callback.role.isNotEmpty ? callback.role : 'user';
 
-      // Validate the token against the gateway; fills in session when URL lacked metadata.
-      await _authClient.fetchSubscription(callback.token);
+      // The session upgrade validates this legacy credential against the gateway.
       if (userId.isEmpty) userId = 'imported';
       if (wallet.isEmpty) wallet = 'imported';
 
@@ -445,6 +540,7 @@ class WalletAuthController extends GetxController {
           walletAddress: wallet,
         ),
         method: 'manual_paste',
+        generation: loginGeneration,
       );
       DesktopWebAuth.clearPendingState();
       await refreshEntitlement();
@@ -475,12 +571,19 @@ class WalletAuthController extends GetxController {
 
   /// Completes sign-in from `erebrusvpn://auth?token=…` (called by [DeepLinkHandler]).
   Future<void> handleWebAuthCallback(String url) async {
+    if (!_mayStartLogin()) return;
     if (!usesWebLogin) return;
 
     awaitingWebCallback.value = false;
     isAuthenticating.value = true;
     authError.value = null;
     try {
+      final loginGeneration = _webLoginGeneration;
+      if (loginGeneration == null) {
+        throw DesktopWebAuthException(
+          'This sign-in was cancelled. Start sign-in again.',
+        );
+      }
       final callback = DesktopWebAuth.parseCallback(url);
       if (callback == null || !callback.isValid) {
         authError.value = 'Sign-in callback was incomplete — try again';
@@ -496,6 +599,7 @@ class WalletAuthController extends GetxController {
           walletAddress: callback.walletAddress,
         ),
         method: 'web',
+        generation: loginGeneration,
       );
       DesktopWebAuth.clearPendingState();
       await refreshEntitlement();
@@ -513,17 +617,20 @@ class WalletAuthController extends GetxController {
   }
 
   Future<void> openWalletModal() async {
+    if (!_mayStartLogin()) return;
     authError.value = null;
     if (appKitModal == null || !reownReady.value) {
       authError.value =
           'Wallet connect is still starting — try again in a moment';
       return;
     }
+    _walletLoginGeneration = await sessions.generation();
     await appKitModal!.openModalView();
   }
 
   /// Mobile Wallet Adapter path — opens the native wallet selector on Seeker/Saga.
   Future<void> signInWithSolanaMobile() async {
+    if (!_mayStartLogin()) return;
     if (!isSolanaMobileDevice.value) {
       authError.value =
           'Solana Mobile sign-in is only available on Seeker and Saga';
@@ -535,6 +642,7 @@ class WalletAuthController extends GetxController {
     isAuthenticating.value = true;
     authError.value = null;
     try {
+      final loginGeneration = await sessions.generation();
       debugPrint('[MWA] gateway=${_authClient.baseUrl}');
       await _authClient.checkReachability();
       // One MWA association: authorize → fetch the challenge → sign it.
@@ -559,6 +667,7 @@ class WalletAuthController extends GetxController {
       await _persistSession(
         session,
         method: 'solana_mobile',
+        generation: loginGeneration,
         mwaToken: result.authToken,
       );
       await refreshEntitlement();
@@ -575,7 +684,26 @@ class WalletAuthController extends GetxController {
     }
   }
 
-  Future<void> signOut() => _clearSession(sessionExpired: false);
+  Future<void> signOut() async {
+    if (_signingOut) return;
+    _signingOut = true;
+    _cancelProviderFlows();
+    var confirmed = false;
+    String? failure;
+    try {
+      confirmed = await sessions.logout();
+    } catch (_) {
+      failure = 'Could not clear secure storage. Please retry signing out.';
+    } finally {
+      await _clearSession(sessionExpired: false);
+      _signingOut = false;
+    }
+    authError.value =
+        failure ??
+        (confirmed
+            ? null
+            : 'Signed out on this device. Remote session revocation is unconfirmed.');
+  }
 
   /// Invalidates a stale session exactly once when concurrent authenticated
   /// requests all observe the same 401 response.
@@ -583,6 +711,7 @@ class WalletAuthController extends GetxController {
     final existing = _sessionExpiryInFlight;
     if (existing != null) return existing;
 
+    _cancelProviderFlows();
     late final Future<void> operation;
     operation = _clearSession(sessionExpired: true).whenComplete(() {
       if (identical(_sessionExpiryInFlight, operation)) {
@@ -593,10 +722,7 @@ class WalletAuthController extends GetxController {
     return operation;
   }
 
-  Future<void> _clearSession({required bool sessionExpired}) async {
-    authError.value = sessionExpired
-        ? 'Your session expired. Please sign in again.'
-        : null;
+  void _resetAccountData() {
     entitlementError.value = null;
     profileError.value = null;
     entitlement.value = EntitlementState.none;
@@ -611,6 +737,13 @@ class WalletAuthController extends GetxController {
     accountOrgInvitesError.value = null;
     hasPendingDeletionRequest.value = false;
     deleteAccountError.value = null;
+  }
+
+  Future<void> _clearSession({required bool sessionExpired}) async {
+    authError.value = sessionExpired
+        ? 'Your session expired. Please sign in again.'
+        : null;
+    _resetAccountData();
     final mwaToken = _mwaAuthToken;
     _applyToken(null);
     _syncGatewayToken();
@@ -622,13 +755,6 @@ class WalletAuthController extends GetxController {
     userId.value = '';
     role.value = '';
     authMethod.value = '';
-    try {
-      await _store.clear();
-    } catch (e) {
-      debugPrint(
-        '[Auth] signOut: secure storage clear failed (session cleared in memory): $e',
-      );
-    }
     if (Get.isRegistered<GatewayController>()) {
       await Get.find<GatewayController>().resetVpnLocalState();
     } else if (Get.isRegistered<VpnController>()) {
@@ -892,10 +1018,8 @@ class WalletAuthController extends GetxController {
       );
     } on AuthException catch (e) {
       entitlementError.value = e.message;
-      entitlement.value = EntitlementState.none;
     } catch (e) {
       entitlementError.value = e.toString();
-      entitlement.value = EntitlementState.none;
     } finally {
       isLoadingEntitlement.value = false;
     }
@@ -933,29 +1057,30 @@ class WalletAuthController extends GetxController {
   Future<void> _persistSession(
     AuthSession session, {
     required String method,
+    required int generation,
     String? mwaToken,
   }) async {
-    _applyToken(session.token);
-    walletAddress.value = session.walletAddress;
-    userId.value = session.userId;
-    role.value = session.role;
-    authMethod.value = method;
-    if (mwaToken != null) _mwaAuthToken = mwaToken;
-    try {
-      await _store.write(
-        token: session.token,
-        walletAddress: session.walletAddress,
-        userId: session.userId,
-        role: session.role,
+    final previousUser = userId.value;
+    final confirmed = await sessions.install(
+      StoredAuthSession(
+        credentials: session,
         authMethod: method,
-        mwaAuthToken: mwaToken ?? _mwaAuthToken,
-      );
-    } catch (e) {
-      debugPrint(
-        '[Auth] session persist failed (in-memory session active): $e',
-      );
+        mwaAuthToken: mwaToken,
+      ),
+      generation: generation,
+    );
+    if (previousUser.isNotEmpty &&
+        previousUser != session.userId &&
+        Get.isRegistered<GatewayController>()) {
+      await Get.find<GatewayController>().resetVpnLocalState();
     }
-    _syncGatewayToken();
+    if (!confirmed) {
+      authError.value =
+          'Signed in. Previous session revocation is unconfirmed.';
+    }
+    // A browser callback is a legacy bearer handoff only. Never copy a webapp's
+    // refresh credential into this independent native app's session.
+    await sessions.ensureFresh();
     unawaited(refreshProfile());
     unawaited(refreshReferrals());
     unawaited(refreshRank());
@@ -991,21 +1116,23 @@ class WalletAuthController extends GetxController {
   }
 
   Future<void> _authenticateConnectedWallet() async {
+    if (!_mayStartLogin() || isAuthenticating.value) return;
+    final loginGeneration = _walletLoginGeneration;
+    if (loginGeneration == null) return;
     final modal = appKitModal;
     if (modal == null || !modal.isConnected) return;
-
-    final address = await _solanaAddress(modal);
-    if (address == null || address.isEmpty) {
-      authError.value =
-          'Connect a Solana wallet (Phantom, Solflare, etc.). '
-          'For email sign-in, use Continue with Email on the login screen — '
-          'the wallet modal email option does not sign you into Erebrus.';
-      return;
-    }
 
     isAuthenticating.value = true;
     authError.value = null;
     try {
+      final address = await _solanaAddress(modal);
+      if (address == null || address.isEmpty) {
+        authError.value =
+            'Connect a Solana wallet (Phantom, Solflare, etc.). '
+            'For email sign-in, use Continue with Email on the login screen — '
+            'the wallet modal email option does not sign you into Erebrus.';
+        return;
+      }
       final challenge = await _authClient.fetchAuthChallenge(
         walletAddress: address,
       );
@@ -1015,7 +1142,11 @@ class WalletAuthController extends GetxController {
         signature: signature,
         publicKey: address,
       );
-      await _persistSession(session, method: 'reown');
+      await _persistSession(
+        session,
+        method: 'reown',
+        generation: loginGeneration,
+      );
       await refreshEntitlement();
       await _refreshGatewayNodes();
       if (modal.isOpen) modal.closeModal();
