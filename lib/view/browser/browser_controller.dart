@@ -484,6 +484,26 @@ class BrowserController extends GetxController {
     await _runActive((controller) => controller.goBack());
   }
 
+  /// System back on the BROWSER tab: asks the live WebView (not the cached
+  /// [BrowserTab.canGoBack]) and steps back one page. False when there is no
+  /// page to go back to, so the shell can handle back instead.
+  Future<bool> goBackIfPossible() async {
+    if (tabs.isEmpty) return false;
+    final tab = activeTab;
+    final generation = tab.generation;
+    if (!tab.configured || !_valid(tab, generation)) return false;
+    final bool back;
+    try {
+      back = await tab.controller.canGoBack();
+    } catch (_) {
+      return false;
+    }
+    if (!back || !_valid(tab, generation)) return false;
+    tab.canGoBack = true;
+    await goBack();
+    return true;
+  }
+
   Future<void> goForward() async {
     if (tabs.isEmpty || !activeTab.canGoForward) return;
     await _runActive((controller) => controller.goForward());
