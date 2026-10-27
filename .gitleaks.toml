@@ -13,3 +13,7 @@ paths = [
   '''android/release-keys/.*''',
   '''scripts/create-android-release-keystore\.sh$''',
 ]
+regexes = [
+  # Fake Idempotency-Key in test/auth_repository_test.dart trips generic-api-key.
+  '''^purchase-123$''',
+]

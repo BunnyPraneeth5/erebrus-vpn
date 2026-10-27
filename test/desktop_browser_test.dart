@@ -204,7 +204,8 @@ void main() {
         'title',
         'secure',
         'javascript',
-        'channel',
+        'channel', // link context menu
+        'channel', // page-requested new tab
         'delegate',
         'load',
       ]);
